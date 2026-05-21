@@ -5,7 +5,7 @@ package main
 import (
 	"sync"
 
-	mosh "github.com/unixshells/mosh-go"
+	mosh "github.com/lovitus/mosh-go"
 	vt "github.com/unixshells/vt-go"
 )
 

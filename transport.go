@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/binary"
+	"errors"
 	"io"
 	"sync"
 	"time"
@@ -20,13 +21,13 @@ import (
 type Transport struct {
 	mu sync.Mutex
 
-	ocb       *OCB
-	toRemote  uint64 // direction bit for outgoing (dirToServer or dirToClient)
-	toLocal   uint64 // direction bit for incoming
+	ocb      *OCB
+	toRemote uint64 // direction bit for outgoing (dirToServer or dirToClient)
+	toLocal  uint64 // direction bit for incoming
 
 	// Outgoing state (SSP §3).
-	sentNum      uint64 // newest state we've sent (new_num)
-	ackedByRemote uint64 // newest state the remote has acknowledged
+	sentNum        uint64 // newest state we've sent (new_num)
+	ackedByRemote  uint64 // newest state the remote has acknowledged
 	pendingDiff    []byte // diff payload waiting to be sent
 	diffSent       bool   // true = pendingDiff has been sent at least once
 	diffOldNum     uint64 // locked oldNum for all diffs until base advances
@@ -63,6 +64,13 @@ type Transport struct {
 	// Latch capability negotiation.
 	localCaps  []byte
 	remoteCaps []byte
+}
+
+// RecvResult reports whether a datagram passed the authenticated transport
+// layer and, when available, the reassembled SSP diff payload.
+type RecvResult struct {
+	Diff          []byte
+	Authenticated bool
 }
 
 const (
@@ -197,17 +205,19 @@ func (t *Transport) Tick() [][]byte {
 }
 
 // Recv processes an incoming wire datagram.
-// Returns the diff payload if a complete message was reassembled, or nil.
-func (t *Transport) Recv(wire []byte) []byte {
+// It returns Authenticated only after direction, replay, OCB tag, and
+// timestamp checks pass. Authenticated datagrams may still have no complete
+// diff yet, for example heartbeats, duplicate fragments, or partial fragments.
+func (t *Transport) Recv(wire []byte) (RecvResult, error) {
 	if len(wire) < minDatagram {
-		return nil
+		return RecvResult{}, nil
 	}
 
 	dirSeq := binary.BigEndian.Uint64(wire[:8])
 
 	// Verify direction.
 	if dirSeq&dirToClient != t.toLocal&dirToClient {
-		return nil
+		return RecvResult{}, nil
 	}
 
 	seq := dirSeq & seqMask
@@ -215,7 +225,7 @@ func (t *Transport) Recv(wire []byte) []byte {
 	t.mu.Lock()
 	if t.seqInMaxSet && seq <= t.seqInMax {
 		t.mu.Unlock()
-		return nil // replay
+		return RecvResult{}, nil // replay
 	}
 	t.mu.Unlock()
 
@@ -224,12 +234,12 @@ func (t *Transport) Recv(wire []byte) []byte {
 	copy(nonce[4:], wire[:8])
 	plaintext := t.ocb.Decrypt(nonce[:], wire[8:])
 	if plaintext == nil {
-		return nil
+		return RecvResult{}, nil
 	}
 
 	// Parse timestamp header (4 bytes).
 	if len(plaintext) < 4 {
-		return nil
+		return RecvResult{}, errors.New("mosh: authenticated datagram missing timestamp")
 	}
 	remoteTS := binary.BigEndian.Uint16(plaintext[0:])
 	// plaintext[2:4] is timestamp_reply — used for RTT.
@@ -249,32 +259,37 @@ func (t *Transport) Recv(wire []byte) []byte {
 		t.updateRTT(tsReply)
 	}
 
+	result := RecvResult{Authenticated: true}
+
 	// Parse fragment.
 	if len(payload) < fragmentHeaderSize {
 		// Heartbeat with no fragment — that's fine.
-		return nil
+		return result, nil
 	}
 	frag, err := UnmarshalFragment(payload)
 	if err != nil {
-		return nil
+		return RecvResult{}, err
 	}
 
 	// Reassemble.
 	t.mu.Lock()
-	msg := t.assembler.Add(frag)
+	msg, err := t.assembler.Add(frag)
 	t.mu.Unlock()
+	if err != nil {
+		return RecvResult{}, err
+	}
 	if msg == nil {
-		return nil
+		return result, nil
 	}
 
 	// Decompress → parse TransportInstruction.
 	decompressed := zlibDecompress(msg)
 	if decompressed == nil {
-		return nil
+		return RecvResult{}, errors.New("mosh: authenticated datagram contains invalid compressed payload")
 	}
 	var ti TransportInstruction
 	if err := ti.Unmarshal(decompressed); err != nil {
-		return nil
+		return RecvResult{}, err
 	}
 
 	if len(ti.LatchCaps) > 0 {
@@ -300,7 +315,7 @@ func (t *Transport) Recv(wire []byte) []byte {
 	// Check if we already have new_num (dedup).
 	for _, n := range t.receivedNums {
 		if n == ti.NewNum {
-			return nil
+			return result, nil
 		}
 	}
 
@@ -313,7 +328,7 @@ func (t *Transport) Recv(wire []byte) []byte {
 		}
 	}
 	if !hasOld {
-		return nil
+		return result, nil
 	}
 
 	// Process throwaway.
@@ -348,7 +363,8 @@ func (t *Transport) Recv(wire []byte) []byte {
 		t.pendingDataAck = true
 	}
 
-	return ti.Diff
+	result.Diff = ti.Diff
+	return result, nil
 }
 
 // AckedByRemote returns the highest state number the remote has acked.

@@ -1,6 +1,9 @@
 package mosh
 
-import "time"
+import (
+	"net"
+	"time"
+)
 
 // Conn is a datagram-oriented connection used by the mosh transport.
 // UDP, WebTransport, and other datagram transports implement this interface.
@@ -18,6 +21,22 @@ type Conn interface {
 	// Close closes the connection.
 	Close() error
 }
+
+// PacketConn is a datagram-oriented server transport.
+// It is intentionally smaller than net.PacketConn so embedders can provide
+// non-UDP transports, while still exposing LocalAddr for MOSH CONNECT lines.
+type PacketConn interface {
+	ReadFrom(p []byte) (int, net.Addr, error)
+	WriteTo(p []byte, addr net.Addr) (int, error)
+	Close() error
+	LocalAddr() net.Addr
+}
+
+// PacketAddr is a lightweight net.Addr for injected packet transports.
+type PacketAddr string
+
+func (a PacketAddr) Network() string { return "mosh" }
+func (a PacketAddr) String() string  { return string(a) }
 
 const (
 	// Direction bits in the 64-bit nonce header.

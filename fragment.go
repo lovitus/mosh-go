@@ -3,6 +3,7 @@ package mosh
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 )
 
 // Fragment wire format (mosh network.cc):
@@ -95,9 +96,9 @@ type FragmentAssembler struct {
 // Add processes a fragment and returns the reassembled message when complete.
 // Returns nil if the message is not yet complete.
 // Drops fragments from old instruction IDs.
-func (a *FragmentAssembler) Add(f Fragment) []byte {
+func (a *FragmentAssembler) Add(f Fragment) ([]byte, error) {
 	if f.ID < a.currentID {
-		return nil // stale
+		return nil, nil // stale
 	}
 
 	// New instruction ID — reset.
@@ -108,21 +109,24 @@ func (a *FragmentAssembler) Add(f Fragment) []byte {
 		a.totalSize = 0
 	}
 
-	// Check total accumulated size.
-	a.totalSize += len(f.Payload)
-	if a.totalSize > maxReassembledSize {
-		a.fragments = nil
-		a.totalNum = -1
-		a.totalSize = 0
-		return nil
-	}
-
 	// Extend slice if needed.
 	idx := int(f.FragmentNum)
 	for len(a.fragments) <= idx {
 		a.fragments = append(a.fragments, nil)
 	}
-	a.fragments[idx] = f.Payload
+	if a.fragments[idx] == nil {
+		if a.totalSize+len(f.Payload) > maxReassembledSize {
+			a.fragments = nil
+			a.totalNum = -1
+			a.totalSize = 0
+			if f.ID < ^uint64(0) {
+				a.currentID = f.ID + 1
+			}
+			return nil, fmt.Errorf("mosh: reassembled fragment payload too large")
+		}
+		a.totalSize += len(f.Payload)
+		a.fragments[idx] = f.Payload
+	}
 
 	if f.Final {
 		a.totalNum = idx + 1
@@ -130,11 +134,11 @@ func (a *FragmentAssembler) Add(f Fragment) []byte {
 
 	// Check completeness.
 	if a.totalNum < 0 || len(a.fragments) < a.totalNum {
-		return nil
+		return nil, nil
 	}
 	for i := 0; i < a.totalNum; i++ {
 		if a.fragments[i] == nil {
-			return nil
+			return nil, nil
 		}
 	}
 
@@ -150,6 +154,6 @@ func (a *FragmentAssembler) Add(f Fragment) []byte {
 
 	a.fragments = nil
 	a.totalNum = -1
-	return msg
+	a.totalSize = 0
+	return msg, nil
 }
-

@@ -9,7 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	mosh "github.com/unixshells/mosh-go"
+	mosh "github.com/lovitus/mosh-go"
 )
 
 func main() {
@@ -67,12 +67,12 @@ func main() {
 			if err != nil {
 				return
 			}
-			diff := transport.Recv(buf[:n])
-			if diff == nil || len(diff) == 0 {
+			result, err := transport.Recv(buf[:n])
+			if err != nil || !result.Authenticated || len(result.Diff) == 0 {
 				continue
 			}
 
-			instrs, err := mosh.UnmarshalHostMessage(diff)
+			instrs, err := mosh.UnmarshalHostMessage(result.Diff)
 			if err != nil {
 				fmt.Printf("unmarshal error: %v\n", err)
 				continue

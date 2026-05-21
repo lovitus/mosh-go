@@ -9,7 +9,7 @@ import (
 	"syscall/js"
 	"time"
 
-	mosh "github.com/unixshells/mosh-go"
+	mosh "github.com/lovitus/mosh-go"
 )
 
 func main() {

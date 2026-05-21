@@ -11,12 +11,13 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/unixshells/vt-go"
 	"github.com/creack/pty"
+	"github.com/unixshells/vt-go"
 )
 
 const (
@@ -38,7 +39,7 @@ type Server struct {
 	key  []byte
 	ocb  *OCB
 	port int
-	conn *net.UDPConn
+	conn PacketConn
 	ptmx *os.File
 	cmd  *exec.Cmd
 
@@ -55,9 +56,9 @@ type Server struct {
 	sentFB     *Framebuffer // what we last sent (pending ack)
 	curVisible atomic.Bool
 
-	// Remote client address — set on first received datagram.
+	// Remote client address — set only from authenticated datagrams.
 	mu         sync.Mutex
-	clientAddr *net.UDPAddr
+	clientAddr net.Addr
 
 	started chan struct{} // closed when PTY is running
 	done    chan struct{}
@@ -75,6 +76,29 @@ func GenerateKey() ([]byte, string, error) {
 // NewServer creates a native mosh server.
 // It binds a UDP port, generates a key, and is ready to serve.
 func NewServer(shell string, portLow, portHigh int) (*Server, error) {
+	conn, port, err := BindUDP(portLow, portHigh)
+	if err != nil {
+		return nil, err
+	}
+	srv, err := newServerWithConn(shell, conn, port)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return srv, nil
+}
+
+// NewServerConn creates a native mosh server over an injected packet
+// transport. The packet transport may be UDP or a tunnel-provided datagram
+// connection. LocalAddr is used to populate Port and ConnectLine.
+func NewServerConn(shell string, conn PacketConn) (*Server, error) {
+	if conn == nil {
+		return nil, fmt.Errorf("packet conn is nil")
+	}
+	return newServerWithConn(shell, conn, portFromAddr(conn.LocalAddr()))
+}
+
+func newServerWithConn(shell string, conn PacketConn, port int) (*Server, error) {
 	key, _, err := GenerateKey()
 	if err != nil {
 		return nil, err
@@ -90,12 +114,6 @@ func NewServer(shell string, portLow, portHigh int) (*Server, error) {
 			shell = "/bin/sh"
 		}
 	}
-
-	conn, port, err := BindUDP(portLow, portHigh)
-	if err != nil {
-		return nil, err
-	}
-
 	return &Server{
 		key:       key,
 		ocb:       ocb,
@@ -110,8 +128,28 @@ func NewServer(shell string, portLow, portHigh int) (*Server, error) {
 	}, nil
 }
 
+func portFromAddr(addr net.Addr) int {
+	if addr == nil {
+		return 0
+	}
+	if udp, ok := addr.(*net.UDPAddr); ok {
+		return udp.Port
+	}
+	_, port, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
 // Port returns the UDP port the server is listening on.
 func (s *Server) Port() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.port
 }
 
@@ -126,7 +164,7 @@ func (s *Server) KeyBase64() string {
 
 // ConnectLine returns the MOSH CONNECT line that clients parse.
 func (s *Server) ConnectLine() string {
-	return fmt.Sprintf("MOSH CONNECT %d %s", s.port, s.KeyBase64())
+	return fmt.Sprintf("MOSH CONNECT %d %s", s.Port(), s.KeyBase64())
 }
 
 // Serve starts the shell and event loop. Blocks until the session ends.
@@ -186,6 +224,18 @@ func (s *Server) Serve() error {
 	s.conn.Close()
 	wg.Wait()
 	return err
+}
+
+// ServeConn replaces the server's packet transport and then calls Serve.
+func (s *Server) ServeConn(conn PacketConn) error {
+	if conn == nil {
+		return fmt.Errorf("packet conn is nil")
+	}
+	s.mu.Lock()
+	s.conn = conn
+	s.port = portFromAddr(conn.LocalAddr())
+	s.mu.Unlock()
+	return s.Serve()
 }
 
 // Done returns a channel that is closed when the server shuts down.
@@ -481,8 +531,10 @@ func (s *Server) recvUDP(out chan<- UserInstruction) {
 		default:
 		}
 
-		s.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		n, addr, err := s.conn.ReadFromUDP(buf)
+		if deadlineConn, ok := s.conn.(interface{ SetReadDeadline(time.Time) error }); ok {
+			_ = deadlineConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		}
+		n, addr, err := s.conn.ReadFrom(buf)
 		if err != nil {
 			if os.IsTimeout(err) {
 				if time.Since(s.transport.LastRecv()) > defaultNetworkTimeout {
@@ -499,22 +551,23 @@ func (s *Server) recvUDP(out chan<- UserInstruction) {
 		data := make([]byte, n)
 		copy(data, buf[:n])
 
-		// Feed to transport — only update clientAddr on successful decrypt.
-		diff := s.transport.Recv(data)
-
-		s.mu.Lock()
-		s.clientAddr = addr
-		s.mu.Unlock()
-
-		if diff == nil {
+		// Feed to transport. Only authenticated datagrams are allowed to
+		// update the roaming client address.
+		result, err := s.transport.Recv(data)
+		if err != nil || !result.Authenticated {
+			continue
+		}
+		if result.Diff == nil {
+			s.setClientAddr(addr)
 			continue
 		}
 
 		// Parse UserMessage protobuf.
-		instrs, err := unmarshalUserMessage(diff)
+		instrs, err := unmarshalUserMessage(result.Diff)
 		if err != nil {
 			continue
 		}
+		s.setClientAddr(addr)
 		for _, ui := range instrs {
 			select {
 			case out <- ui:
@@ -523,6 +576,12 @@ func (s *Server) recvUDP(out chan<- UserInstruction) {
 			}
 		}
 	}
+}
+
+func (s *Server) setClientAddr(addr net.Addr) {
+	s.mu.Lock()
+	s.clientAddr = addr
+	s.mu.Unlock()
 }
 
 // sendDatagrams sends wire datagrams to the client.
@@ -534,7 +593,7 @@ func (s *Server) sendDatagrams(datagrams [][]byte) {
 		return
 	}
 	for _, dg := range datagrams {
-		s.conn.WriteToUDP(dg, addr)
+		s.conn.WriteTo(dg, addr)
 	}
 }
 
@@ -610,5 +669,5 @@ func (s *Server) sendToClient(payload []byte) {
 	copy(wire[:8], dirSeqBytes[:])
 	copy(wire[8:], tagAndCT)
 
-	s.conn.WriteToUDP(wire, addr)
+	s.conn.WriteTo(wire, addr)
 }

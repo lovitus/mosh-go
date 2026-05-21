@@ -6,6 +6,15 @@ import (
 	"testing"
 )
 
+func addFragment(t *testing.T, a *FragmentAssembler, f Fragment) []byte {
+	t.Helper()
+	result, err := a.Add(f)
+	if err != nil {
+		t.Fatalf("add fragment: %v", err)
+	}
+	return result
+}
+
 func TestFragmentRoundTrip(t *testing.T) {
 	f := Fragment{
 		ID:          42,
@@ -117,7 +126,7 @@ func TestFragmentAssemblerInOrder(t *testing.T) {
 
 	var a FragmentAssembler
 	for i, f := range frags {
-		result := a.Add(f)
+		result := addFragment(t, &a, f)
 		if i < len(frags)-1 {
 			if result != nil {
 				t.Fatalf("premature assembly at fragment %d", i)
@@ -143,7 +152,7 @@ func TestFragmentAssemblerOutOfOrder(t *testing.T) {
 	var a FragmentAssembler
 	var result []byte
 	for _, idx := range order {
-		r := a.Add(frags[idx])
+		r := addFragment(t, &a, frags[idx])
 		if r != nil {
 			result = r
 		}
@@ -160,12 +169,12 @@ func TestFragmentAssemblerNewID(t *testing.T) {
 	var a FragmentAssembler
 
 	// Start assembling ID=1 but never finish.
-	a.Add(Fragment{ID: 1, FragmentNum: 0, Payload: []byte("old")})
+	addFragment(t, &a, Fragment{ID: 1, FragmentNum: 0, Payload: []byte("old")})
 
 	// New ID=2 arrives — old state should be discarded.
 	data := []byte("new message")
 	frags := Fragmentize(2, data)
-	result := a.Add(frags[0])
+	result := addFragment(t, &a, frags[0])
 	if result == nil {
 		t.Fatal("single-fragment message should complete")
 	}
@@ -178,10 +187,10 @@ func TestFragmentAssemblerStaleID(t *testing.T) {
 	var a FragmentAssembler
 
 	// Set current to ID=5.
-	a.Add(Fragment{ID: 5, FragmentNum: 0, Final: true, Payload: []byte("five")})
+	addFragment(t, &a, Fragment{ID: 5, FragmentNum: 0, Final: true, Payload: []byte("five")})
 
 	// Stale ID=3 should be dropped.
-	result := a.Add(Fragment{ID: 3, FragmentNum: 0, Final: true, Payload: []byte("three")})
+	result := addFragment(t, &a, Fragment{ID: 3, FragmentNum: 0, Final: true, Payload: []byte("three")})
 	if result != nil {
 		t.Fatal("stale ID should be dropped")
 	}
@@ -195,11 +204,11 @@ func TestAssemblerMissingFragment(t *testing.T) {
 	frag0 := Fragment{ID: 1, FragmentNum: 0, Final: false, Payload: []byte("aaa")}
 	frag2 := Fragment{ID: 1, FragmentNum: 2, Final: true, Payload: []byte("ccc")}
 
-	if r := a.Add(frag0); r != nil {
+	if r := addFragment(t, &a, frag0); r != nil {
 		t.Fatal("should not complete after fragment 0")
 	}
 	// Skip fragment 1 entirely.
-	if r := a.Add(frag2); r != nil {
+	if r := addFragment(t, &a, frag2); r != nil {
 		t.Fatal("should not complete with missing fragment 1")
 	}
 }
@@ -212,13 +221,13 @@ func TestAssemblerDuplicateFragment(t *testing.T) {
 	frag0 := Fragment{ID: 1, FragmentNum: 0, Final: false, Payload: []byte("hello")}
 	frag1 := Fragment{ID: 1, FragmentNum: 1, Final: true, Payload: []byte(" world")}
 
-	if r := a.Add(frag0); r != nil {
+	if r := addFragment(t, &a, frag0); r != nil {
 		t.Fatal("should not complete after first fragment 0")
 	}
-	if r := a.Add(frag0); r != nil {
+	if r := addFragment(t, &a, frag0); r != nil {
 		t.Fatal("should not complete after duplicate fragment 0")
 	}
-	result := a.Add(frag1)
+	result := addFragment(t, &a, frag1)
 	if result == nil {
 		t.Fatal("should complete after fragment 1")
 	}
@@ -241,7 +250,7 @@ func TestFragmentWireRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if r := a.Add(got); r != nil {
+		if r := addFragment(t, &a, got); r != nil {
 			result = r
 		}
 	}

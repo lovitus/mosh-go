@@ -23,10 +23,10 @@ type Client struct {
 	// Action tracking for cumulative diffs.
 	actionsMu        sync.Mutex
 	actions          []UserInstruction
-	ackedActionCount int                // how many actions the server has
+	ackedActionCount int // how many actions the server has
 	lastAcked        uint64
-	sentActionCounts map[uint64]int     // sentNum → action count at that state
-	dirty            bool               // true = new actions since last tick
+	sentActionCounts map[uint64]int // sentNum → action count at that state
+	dirty            bool           // true = new actions since last tick
 
 	done chan struct{}
 	wg   sync.WaitGroup
@@ -145,7 +145,11 @@ func (c *Client) RecvRaw(timeout time.Duration) []byte {
 
 	data := make([]byte, n)
 	copy(data, buf[:n])
-	return c.transport.Recv(data)
+	result, err := c.transport.Recv(data)
+	if err != nil || !result.Authenticated {
+		return nil
+	}
+	return result.Diff
 }
 
 // Send sends keystrokes to the server.
@@ -163,7 +167,6 @@ func (c *Client) Resize(cols, rows uint16) {
 	c.dirty = true
 	c.actionsMu.Unlock()
 }
-
 
 // Recv reads accumulated terminal output, blocking until output is available
 // or the timeout expires. Returns nil on timeout.
@@ -282,12 +285,12 @@ func (c *Client) recvLoop() {
 		data := make([]byte, n)
 		copy(data, buf[:n])
 
-		diff := c.transport.Recv(data)
-		if diff == nil {
+		result, err := c.transport.Recv(data)
+		if err != nil || !result.Authenticated || result.Diff == nil {
 			continue
 		}
 
-		instrs, err := UnmarshalHostMessage(diff)
+		instrs, err := UnmarshalHostMessage(result.Diff)
 		if err != nil || len(instrs) == 0 {
 			continue
 		}

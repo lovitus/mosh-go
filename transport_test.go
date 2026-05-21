@@ -26,6 +26,18 @@ func newTestPair(t *testing.T) (*Transport, *Transport) {
 	return server, client
 }
 
+func recvDiff(t *testing.T, transport *Transport, wire []byte) []byte {
+	t.Helper()
+	result, err := transport.Recv(wire)
+	if err != nil {
+		t.Fatalf("recv: %v", err)
+	}
+	if !result.Authenticated {
+		return nil
+	}
+	return result.Diff
+}
+
 func TestTransportBasicExchange(t *testing.T) {
 	server, client := newTestPair(t)
 
@@ -39,7 +51,7 @@ func TestTransportBasicExchange(t *testing.T) {
 	// Client receives.
 	var diff []byte
 	for _, dg := range datagrams {
-		if d := client.Recv(dg); d != nil {
+		if d := recvDiff(t, client, dg); d != nil {
 			diff = d
 		}
 	}
@@ -57,7 +69,7 @@ func TestTransportBasicExchange(t *testing.T) {
 	// Server receives.
 	diff = nil
 	for _, dg := range datagrams {
-		if d := server.Recv(dg); d != nil {
+		if d := recvDiff(t, server, dg); d != nil {
 			diff = d
 		}
 	}
@@ -73,12 +85,12 @@ func TestTransportReplayRejected(t *testing.T) {
 	datagrams := server.Tick()
 
 	// First receive works.
-	if d := client.Recv(datagrams[0]); d == nil {
+	if d := recvDiff(t, client, datagrams[0]); d == nil {
 		t.Fatal("first receive failed")
 	}
 
 	// Replay should be rejected.
-	if d := client.Recv(datagrams[0]); d != nil {
+	if d := recvDiff(t, client, datagrams[0]); d != nil {
 		t.Fatal("replay should be rejected")
 	}
 }
@@ -90,7 +102,7 @@ func TestTransportWrongDirection(t *testing.T) {
 	datagrams := server.Tick()
 
 	// Server receiving its own datagram (wrong direction).
-	if d := server.Recv(datagrams[0]); d != nil {
+	if d := recvDiff(t, server, datagrams[0]); d != nil {
 		t.Fatal("wrong direction should be rejected")
 	}
 }
@@ -110,7 +122,7 @@ func TestTransportLargePayload(t *testing.T) {
 
 	var diff []byte
 	for _, dg := range datagrams {
-		if d := client.Recv(dg); d != nil {
+		if d := recvDiff(t, client, dg); d != nil {
 			diff = d
 		}
 	}
@@ -161,12 +173,12 @@ func TestTransportMultipleExchanges(t *testing.T) {
 
 		server.SetPending(payload)
 		for _, dg := range server.Tick() {
-			client.Recv(dg)
+			recvDiff(t, client, dg)
 		}
 
 		client.SetPending(payload)
 		for _, dg := range client.Tick() {
-			server.Recv(dg)
+			recvDiff(t, server, dg)
 		}
 	}
 
@@ -232,7 +244,7 @@ func TestTransportCompressionBomb(t *testing.T) {
 	copy(wire[8:], tagAndCT)
 
 	// Client should reject the bomb — Recv returns nil.
-	result := client.Recv(wire)
+	result := recvDiff(t, client, wire)
 	if result != nil {
 		t.Fatalf("compression bomb should be rejected, got %d bytes", len(result))
 	}
@@ -276,7 +288,7 @@ func TestTransportConcurrentSendRecv(t *testing.T) {
 			client.SetPending(payload)
 			datagrams := client.Tick()
 			for _, dg := range datagrams {
-				server.Recv(dg)
+				recvDiff(t, server, dg)
 			}
 			errs <- nil
 		}(i)
@@ -299,11 +311,11 @@ func TestTransportCapsNegotiation(t *testing.T) {
 	// Exchange a message so caps are transmitted.
 	server.SetPending([]byte("hello"))
 	for _, dg := range server.Tick() {
-		client.Recv(dg)
+		recvDiff(t, client, dg)
 	}
 	client.SetPending([]byte("world"))
 	for _, dg := range client.Tick() {
-		server.Recv(dg)
+		recvDiff(t, server, dg)
 	}
 
 	// Both should see remote caps now.
@@ -328,11 +340,11 @@ func TestTransportCapsNegotiation(t *testing.T) {
 
 	server.SetPending([]byte("a"))
 	for _, dg := range server.Tick() {
-		client.Recv(dg)
+		recvDiff(t, client, dg)
 	}
 	client.SetPending([]byte("b"))
 	for _, dg := range client.Tick() {
-		server.Recv(dg)
+		recvDiff(t, server, dg)
 	}
 
 	if !server.HasCap(0x01) {
@@ -357,7 +369,7 @@ func TestTransportNoCaps(t *testing.T) {
 	// Exchange without caps.
 	server.SetPending([]byte("data"))
 	for _, dg := range server.Tick() {
-		client.Recv(dg)
+		recvDiff(t, client, dg)
 	}
 
 	// RemoteCaps should still be nil.
@@ -384,7 +396,7 @@ func TestTransportHighSequenceNumbers(t *testing.T) {
 
 	var diff []byte
 	for _, dg := range datagrams {
-		if d := client.Recv(dg); d != nil {
+		if d := recvDiff(t, client, dg); d != nil {
 			diff = d
 		}
 	}

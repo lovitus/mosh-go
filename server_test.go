@@ -139,7 +139,7 @@ func TestServerE2E(t *testing.T) {
 		if n < minDatagram {
 			return nil
 		}
-		diff := clientTransport.Recv(buf[:n])
+		diff := recvDiff(t, clientTransport, buf[:n])
 		if diff == nil {
 			return nil
 		}
@@ -486,7 +486,7 @@ func TestServeRW(t *testing.T) {
 		if err != nil {
 			return nil
 		}
-		diff := clientTransport.Recv(buf[:n])
+		diff := recvDiff(t, clientTransport, buf[:n])
 		if diff == nil {
 			return nil
 		}
@@ -608,7 +608,7 @@ func TestServeRW(t *testing.T) {
 		if err != nil {
 			return nil
 		}
-		diff := clientTransport2.Recv(buf[:n])
+		diff := recvDiff(t, clientTransport2, buf[:n])
 		if diff == nil {
 			return nil
 		}

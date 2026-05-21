@@ -13,9 +13,9 @@ fragmentation, and the protobuf state sync layer.
 ## Install
 
 ```
-go install github.com/unixshells/mosh-go/cmd/mosh@latest
-go install github.com/unixshells/mosh-go/cmd/mosh-server@latest
-go install github.com/unixshells/mosh-go/cmd/mosh-client@latest
+go install github.com/lovitus/mosh-go/cmd/mosh@latest
+go install github.com/lovitus/mosh-go/cmd/mosh-server@latest
+go install github.com/lovitus/mosh-go/cmd/mosh-client@latest
 ```
 
 ## Usage
@@ -44,7 +44,7 @@ MOSH_KEY=<key> mosh-client <host> <port>
 ## Library
 
 ```go
-import mosh "github.com/unixshells/mosh-go"
+import mosh "github.com/lovitus/mosh-go"
 
 // Server
 srv, _ := mosh.NewServer("/bin/bash", 60000, 60999)
