@@ -49,8 +49,9 @@ type Server struct {
 	rows  int
 
 	// Transport handles SSP sequencing, fragmentation, and crypto.
-	transportMu sync.RWMutex
-	transport   *Transport
+	transportMu  sync.RWMutex
+	transport    *Transport
+	transportGen uint64
 
 	// VT emulator and framebuffer state for CUP-based diffing.
 	emu        *vt.Emulator
@@ -209,6 +210,7 @@ func (s *Server) Takeover() (string, error) {
 	s.mu.Unlock()
 
 	s.transportMu.Lock()
+	s.transportGen++
 	s.transport = NewTransport(ocb, true)
 	s.transportMu.Unlock()
 
@@ -219,10 +221,16 @@ func (s *Server) Takeover() (string, error) {
 	return strings.TrimRight(keyB64, "="), nil
 }
 
-func (s *Server) currentTransport() *Transport {
+func (s *Server) currentTransport() (*Transport, uint64) {
 	s.transportMu.RLock()
 	defer s.transportMu.RUnlock()
-	return s.transport
+	return s.transport, s.transportGen
+}
+
+func (s *Server) isCurrentTransport(gen uint64) bool {
+	s.transportMu.RLock()
+	defer s.transportMu.RUnlock()
+	return gen == s.transportGen
 }
 
 func (s *Server) idleNetworkTimeout() time.Duration {
@@ -434,7 +442,7 @@ func (s *Server) mainLoopRW(rw io.Writer, resize func(cols, rows uint16), ioOutp
 			s.queueFullRefresh()
 
 		case <-ticker.C:
-			transport := s.currentTransport()
+			transport, _ := s.currentTransport()
 			if s.sentFB != nil && transport.AckedByRemote() >= transport.SentNum() {
 				s.baseFB = s.sentFB
 				s.sentFB = nil
@@ -495,7 +503,7 @@ func (s *Server) queueFullRefresh() {
 		return
 	}
 	hi := HostInstruction{Hoststring: diffBytes, EchoAckNum: -1}
-	transport := s.currentTransport()
+	transport, _ := s.currentTransport()
 	transport.SetPending(marshalHostMessage([]HostInstruction{hi}))
 	s.sentFB = currentFB
 }
@@ -565,7 +573,7 @@ func (s *Server) mainLoop(ptyOutput <-chan []byte, userInput <-chan UserInstruct
 
 		case <-ticker.C:
 			// Advance base when client acks all pending.
-			transport := s.currentTransport()
+			transport, _ := s.currentTransport()
 			if s.sentFB != nil && transport.AckedByRemote() >= transport.SentNum() {
 				s.baseFB = s.sentFB
 				s.sentFB = nil
@@ -632,7 +640,8 @@ func (s *Server) recvUDP(out chan<- UserInstruction) {
 		n, addr, err := s.conn.ReadFrom(buf)
 		if err != nil {
 			if os.IsTimeout(err) {
-				if time.Since(s.currentTransport().LastRecv()) > s.idleNetworkTimeout() {
+				transport, _ := s.currentTransport()
+				if time.Since(transport.LastRecv()) > s.idleNetworkTimeout() {
 					return
 				}
 				continue
@@ -648,8 +657,12 @@ func (s *Server) recvUDP(out chan<- UserInstruction) {
 
 		// Feed to transport. Only authenticated datagrams are allowed to
 		// update the roaming client address.
-		result, err := s.currentTransport().Recv(data)
+		transport, gen := s.currentTransport()
+		result, err := transport.Recv(data)
 		if err != nil || !result.Authenticated {
+			continue
+		}
+		if !s.isCurrentTransport(gen) {
 			continue
 		}
 		if result.Diff == nil {
@@ -736,7 +749,7 @@ func (s *Server) sendToClient(payload []byte) {
 		return
 	}
 
-	transport := s.currentTransport()
+	transport, _ := s.currentTransport()
 	transport.mu.Lock()
 	transport.seqOut++
 	seq := transport.seqOut

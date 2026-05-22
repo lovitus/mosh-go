@@ -353,10 +353,14 @@ func TestServerTakeoverRequiresFreshKey(t *testing.T) {
 	oldClient.ForceNextSend()
 	conn.inject(oldAddr, oldClient.Tick()[0])
 	waitForAddr(t, srv, oldAddr, true)
+	_, oldGen := srv.currentTransport()
 
 	newKey, err := srv.Takeover()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if srv.isCurrentTransport(oldGen) {
+		t.Fatal("old transport generation is still current after takeover")
 	}
 	if newKey == "" || newKey == base64.StdEncoding.EncodeToString(oldKey) {
 		t.Fatalf("Takeover key = %q, want fresh key", newKey)
