@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,7 +49,8 @@ type Server struct {
 	rows  int
 
 	// Transport handles SSP sequencing, fragmentation, and crypto.
-	transport *Transport
+	transportMu sync.RWMutex
+	transport   *Transport
 
 	// VT emulator and framebuffer state for CUP-based diffing.
 	emu        *vt.Emulator
@@ -62,6 +64,9 @@ type Server struct {
 
 	started chan struct{} // closed when PTY is running
 	done    chan struct{}
+
+	networkTimeout time.Duration
+	forceRefresh   chan struct{}
 }
 
 // GenerateKey creates a random 128-bit mosh key and returns it as base64.
@@ -115,16 +120,18 @@ func newServerWithConn(shell string, conn PacketConn, port int) (*Server, error)
 		}
 	}
 	return &Server{
-		key:       key,
-		ocb:       ocb,
-		port:      port,
-		conn:      conn,
-		shell:     shell,
-		cols:      defaultCols,
-		rows:      defaultRows,
-		transport: NewTransport(ocb, true),
-		started:   make(chan struct{}),
-		done:      make(chan struct{}),
+		key:            key,
+		ocb:            ocb,
+		port:           port,
+		conn:           conn,
+		shell:          shell,
+		cols:           defaultCols,
+		rows:           defaultRows,
+		transport:      NewTransport(ocb, true),
+		started:        make(chan struct{}),
+		done:           make(chan struct{}),
+		networkTimeout: defaultNetworkTimeout,
+		forceRefresh:   make(chan struct{}, 1),
 	}, nil
 }
 
@@ -155,6 +162,8 @@ func (s *Server) Port() int {
 
 // KeyBase64 returns the mosh key as a base64 string (22 chars, no padding).
 func (s *Server) KeyBase64() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	encoded := base64.StdEncoding.EncodeToString(s.key)
 	for len(encoded) > 0 && encoded[len(encoded)-1] == '=' {
 		encoded = encoded[:len(encoded)-1]
@@ -165,6 +174,64 @@ func (s *Server) KeyBase64() string {
 // ConnectLine returns the MOSH CONNECT line that clients parse.
 func (s *Server) ConnectLine() string {
 	return fmt.Sprintf("MOSH CONNECT %d %s", s.Port(), s.KeyBase64())
+}
+
+// SetNetworkTimeout sets the idle network timeout. The server exits when no
+// authenticated packets are received for this duration. A non-positive timeout
+// restores the default.
+func (s *Server) SetNetworkTimeout(timeout time.Duration) {
+	if timeout <= 0 {
+		timeout = defaultNetworkTimeout
+	}
+	s.mu.Lock()
+	s.networkTimeout = timeout
+	s.mu.Unlock()
+}
+
+// Takeover resets the client association and transport key while keeping the
+// existing PTY/shell and terminal state alive. It is intended for a trusted
+// control plane that wants a fresh client process to attach to an existing
+// server session without reusing old SSP sequence numbers.
+func (s *Server) Takeover() (string, error) {
+	key, keyB64, err := GenerateKey()
+	if err != nil {
+		return "", err
+	}
+	ocb, err := NewOCB(key)
+	if err != nil {
+		return "", err
+	}
+
+	s.mu.Lock()
+	s.key = key
+	s.ocb = ocb
+	s.clientAddr = nil
+	s.mu.Unlock()
+
+	s.transportMu.Lock()
+	s.transport = NewTransport(ocb, true)
+	s.transportMu.Unlock()
+
+	select {
+	case s.forceRefresh <- struct{}{}:
+	default:
+	}
+	return strings.TrimRight(keyB64, "="), nil
+}
+
+func (s *Server) currentTransport() *Transport {
+	s.transportMu.RLock()
+	defer s.transportMu.RUnlock()
+	return s.transport
+}
+
+func (s *Server) idleNetworkTimeout() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.networkTimeout <= 0 {
+		return defaultNetworkTimeout
+	}
+	return s.networkTimeout
 }
 
 // Serve starts the shell and event loop. Blocks until the session ends.
@@ -363,8 +430,12 @@ func (s *Server) mainLoopRW(rw io.Writer, resize func(cols, rows uint16), ioOutp
 				dirty = true
 			}
 
+		case <-s.forceRefresh:
+			s.queueFullRefresh()
+
 		case <-ticker.C:
-			if s.sentFB != nil && s.transport.AckedByRemote() >= s.transport.SentNum() {
+			transport := s.currentTransport()
+			if s.sentFB != nil && transport.AckedByRemote() >= transport.SentNum() {
 				s.baseFB = s.sentFB
 				s.sentFB = nil
 			}
@@ -374,13 +445,13 @@ func (s *Server) mainLoopRW(rw io.Writer, resize func(cols, rows uint16), ioOutp
 				diffBytes := currentFB.Diff(s.baseFB)
 				if len(diffBytes) > 0 {
 					hi := HostInstruction{Hoststring: diffBytes, EchoAckNum: -1}
-					s.transport.SetPending(marshalHostMessage([]HostInstruction{hi}))
+					transport.SetPending(marshalHostMessage([]HostInstruction{hi}))
 					s.sentFB = currentFB
 				}
 				dirty = false
 			}
 
-			datagrams := s.transport.Tick()
+			datagrams := transport.Tick()
 			s.sendDatagrams(datagrams)
 		}
 	}
@@ -407,6 +478,26 @@ func (s *Server) Close() {
 	if s.ptmx != nil {
 		s.ptmx.Close()
 	}
+}
+
+func (s *Server) queueFullRefresh() {
+	if s.emu == nil {
+		return
+	}
+	currentFB := SnapshotEmulator(s.emu, s.curVisible.Load())
+	s.mu.Lock()
+	cols, rows := s.cols, s.rows
+	s.mu.Unlock()
+	s.baseFB = NewFramebuffer(cols, rows)
+	s.sentFB = nil
+	diffBytes := currentFB.Diff(s.baseFB)
+	if len(diffBytes) == 0 {
+		return
+	}
+	hi := HostInstruction{Hoststring: diffBytes, EchoAckNum: -1}
+	transport := s.currentTransport()
+	transport.SetPending(marshalHostMessage([]HostInstruction{hi}))
+	s.sentFB = currentFB
 }
 
 // mainLoop is the SSP event loop. It feeds PTY output to a VT emulator,
@@ -469,9 +560,13 @@ func (s *Server) mainLoop(ptyOutput <-chan []byte, userInput <-chan UserInstruct
 				dirty = true
 			}
 
+		case <-s.forceRefresh:
+			s.queueFullRefresh()
+
 		case <-ticker.C:
 			// Advance base when client acks all pending.
-			if s.sentFB != nil && s.transport.AckedByRemote() >= s.transport.SentNum() {
+			transport := s.currentTransport()
+			if s.sentFB != nil && transport.AckedByRemote() >= transport.SentNum() {
 				s.baseFB = s.sentFB
 				s.sentFB = nil
 			}
@@ -481,13 +576,13 @@ func (s *Server) mainLoop(ptyOutput <-chan []byte, userInput <-chan UserInstruct
 				diffBytes := currentFB.Diff(s.baseFB)
 				if len(diffBytes) > 0 {
 					hi := HostInstruction{Hoststring: diffBytes, EchoAckNum: -1}
-					s.transport.SetPending(marshalHostMessage([]HostInstruction{hi}))
+					transport.SetPending(marshalHostMessage([]HostInstruction{hi}))
 					s.sentFB = currentFB
 				}
 				dirty = false
 			}
 
-			datagrams := s.transport.Tick()
+			datagrams := transport.Tick()
 			s.sendDatagrams(datagrams)
 		}
 	}
@@ -537,7 +632,7 @@ func (s *Server) recvUDP(out chan<- UserInstruction) {
 		n, addr, err := s.conn.ReadFrom(buf)
 		if err != nil {
 			if os.IsTimeout(err) {
-				if time.Since(s.transport.LastRecv()) > defaultNetworkTimeout {
+				if time.Since(s.currentTransport().LastRecv()) > s.idleNetworkTimeout() {
 					return
 				}
 				continue
@@ -553,7 +648,7 @@ func (s *Server) recvUDP(out chan<- UserInstruction) {
 
 		// Feed to transport. Only authenticated datagrams are allowed to
 		// update the roaming client address.
-		result, err := s.transport.Recv(data)
+		result, err := s.currentTransport().Recv(data)
 		if err != nil || !result.Authenticated {
 			continue
 		}
@@ -641,11 +736,12 @@ func (s *Server) sendToClient(payload []byte) {
 		return
 	}
 
-	s.transport.mu.Lock()
-	s.transport.seqOut++
-	seq := s.transport.seqOut
-	lastTS := s.transport.lastTS
-	s.transport.mu.Unlock()
+	transport := s.currentTransport()
+	transport.mu.Lock()
+	transport.seqOut++
+	seq := transport.seqOut
+	lastTS := transport.lastTS
+	transport.mu.Unlock()
 	s.mu.Unlock()
 
 	dirSeq := dirToClient | (seq & seqMask)

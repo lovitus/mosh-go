@@ -5,6 +5,7 @@ package mosh
 import (
 	"bytes"
 	"compress/zlib"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"net"
@@ -328,6 +329,82 @@ func TestServerRoamingOnlyUsesAuthenticatedDatagrams(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for user instruction")
+	}
+}
+
+func TestServerTakeoverRequiresFreshKey(t *testing.T) {
+	conn := newMemoryPacketConn(PacketAddr("127.0.0.1:60003"))
+	srv, err := NewServerConn("/bin/sh", conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	out := make(chan UserInstruction, 8)
+	go srv.recvUDP(out)
+
+	oldKey := append([]byte(nil), srv.key...)
+	oldOCB, err := NewOCB(oldKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldClient := NewTransport(oldOCB, false)
+	oldAddr := PacketAddr("old-client:1")
+	oldClient.ForceNextSend()
+	conn.inject(oldAddr, oldClient.Tick()[0])
+	waitForAddr(t, srv, oldAddr, true)
+
+	newKey, err := srv.Takeover()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newKey == "" || newKey == base64.StdEncoding.EncodeToString(oldKey) {
+		t.Fatalf("Takeover key = %q, want fresh key", newKey)
+	}
+	waitForAddr(t, srv, oldAddr, false)
+
+	oldClient.SetPending(marshalUserMessage([]UserInstruction{{Keys: []byte("old")}}))
+	for _, dg := range oldClient.Tick() {
+		conn.inject(oldAddr, dg)
+	}
+	waitForAddr(t, srv, oldAddr, false)
+
+	newOCB, err := NewOCB(srv.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newClient := NewTransport(newOCB, false)
+	newAddr := PacketAddr("new-client:1")
+	newClient.SetPending(marshalUserMessage([]UserInstruction{{Keys: []byte("new")}}))
+	for _, dg := range newClient.Tick() {
+		conn.inject(newAddr, dg)
+	}
+	waitForAddr(t, srv, newAddr, true)
+	select {
+	case ui := <-out:
+		if string(ui.Keys) != "new" {
+			t.Fatalf("keys = %q, want new", ui.Keys)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for new client instruction")
+	}
+}
+
+func TestServerNetworkTimeoutConfig(t *testing.T) {
+	conn := newMemoryPacketConn(PacketAddr("127.0.0.1:60004"))
+	srv, err := NewServerConn("/bin/sh", conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	srv.SetNetworkTimeout(14 * 24 * time.Hour)
+	if got := srv.idleNetworkTimeout(); got != 14*24*time.Hour {
+		t.Fatalf("idleNetworkTimeout = %v, want 14 days", got)
+	}
+	srv.SetNetworkTimeout(0)
+	if got := srv.idleNetworkTimeout(); got != defaultNetworkTimeout {
+		t.Fatalf("idleNetworkTimeout = %v, want default %v", got, defaultNetworkTimeout)
 	}
 }
 
