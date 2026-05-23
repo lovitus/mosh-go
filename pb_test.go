@@ -160,24 +160,44 @@ func TestUserMessageEmpty(t *testing.T) {
 	}
 }
 
-func TestVarintSize(t *testing.T) {
-	tests := []struct {
-		v    uint64
-		want int
-	}{
-		{0, 1},
-		{1, 1},
-		{127, 1},
-		{128, 2},
-		{16383, 2},
-		{16384, 3},
-		{1<<63 - 1, 9},
-		{1<<64 - 1, 10},
+func TestHostAndUserMessageSkipUnknownTopLevelFields(t *testing.T) {
+	host := marshalHostMessage([]HostInstruction{{Hoststring: []byte("hello"), EchoAckNum: -1}})
+	host = append(appendTagBytes(nil, 99, []byte("future-host")), host...)
+	host = append(host, appendTagVarint(nil, 100, 42)...)
+	gotHost, err := unmarshalHostMessage(host)
+	if err != nil {
+		t.Fatalf("host unknown field: %v", err)
 	}
-	for _, tt := range tests {
-		if got := varintSize(tt.v); got != tt.want {
-			t.Errorf("varintSize(%d) = %d, want %d", tt.v, got, tt.want)
-		}
+	if len(gotHost) != 1 || !bytes.Equal(gotHost[0].Hoststring, []byte("hello")) {
+		t.Fatalf("host decode = %+v", gotHost)
+	}
+
+	user := marshalUserMessage([]UserInstruction{{Keys: []byte("x")}})
+	user = append(appendTagBytes(nil, 99, []byte("future-user")), user...)
+	user = append(user, appendTagVarint(nil, 100, 42)...)
+	gotUser, err := unmarshalUserMessage(user)
+	if err != nil {
+		t.Fatalf("user unknown field: %v", err)
+	}
+	if len(gotUser) != 1 || !bytes.Equal(gotUser[0].Keys, []byte("x")) {
+		t.Fatalf("user decode = %+v", gotUser)
+	}
+}
+
+func TestUnknownBytesFieldLengthExceedingBufferReturnsError(t *testing.T) {
+	data := appendTag(nil, 99, wireBytes)
+	data = appendVarint(data, 10)
+	data = append(data, 1, 2)
+
+	if _, err := unmarshalHostMessage(data); err == nil {
+		t.Fatal("expected host message error")
+	}
+	if _, err := unmarshalUserMessage(data); err == nil {
+		t.Fatal("expected user message error")
+	}
+	var ti TransportInstruction
+	if err := ti.Unmarshal(data); err == nil {
+		t.Fatal("expected transport instruction error")
 	}
 }
 

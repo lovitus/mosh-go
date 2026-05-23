@@ -3,7 +3,6 @@ package mosh
 import (
 	"encoding/binary"
 	"errors"
-	"math/bits"
 )
 
 // Hand-rolled protobuf encoding for the three mosh .proto schemas.
@@ -141,16 +140,39 @@ func skipField(b []byte, wtype int) int {
 		return n
 	case wireBytes:
 		length, n := decodeVarint(b)
-		if n == 0 {
+		if n == 0 || length > uint64(len(b)-n) {
 			return 0
 		}
 		return n + int(length)
 	case 5: // 32-bit
+		if len(b) < 4 {
+			return 0
+		}
 		return 4
 	case 1: // 64-bit
+		if len(b) < 8 {
+			return 0
+		}
 		return 8
 	}
 	return 0
+}
+
+func consumeVarint(b []byte) (uint64, []byte, bool) {
+	v, n := decodeVarint(b)
+	if n == 0 {
+		return 0, nil, false
+	}
+	return v, b[n:], true
+}
+
+func consumeBytes(b []byte) ([]byte, []byte, bool) {
+	length, n := decodeVarint(b)
+	if n == 0 || length > uint64(len(b)-n) {
+		return nil, nil, false
+	}
+	end := n + int(length)
+	return b[n:end], b[end:], true
 }
 
 // --- TransportInstruction ---
@@ -186,61 +208,85 @@ func (ti *TransportInstruction) Unmarshal(data []byte) error {
 
 		switch field {
 		case 1:
-			v, n := decodeVarint(data)
-			if n == 0 {
+			if wtype != wireVarint {
+				return errTruncated
+			}
+			v, rest, ok := consumeVarint(data)
+			if !ok {
 				return errTruncated
 			}
 			ti.ProtocolVersion = uint32(v)
-			data = data[n:]
+			data = rest
 		case 2:
-			v, n := decodeVarint(data)
-			if n == 0 {
+			if wtype != wireVarint {
+				return errTruncated
+			}
+			v, rest, ok := consumeVarint(data)
+			if !ok {
 				return errTruncated
 			}
 			ti.OldNum = v
-			data = data[n:]
+			data = rest
 		case 3:
-			v, n := decodeVarint(data)
-			if n == 0 {
+			if wtype != wireVarint {
+				return errTruncated
+			}
+			v, rest, ok := consumeVarint(data)
+			if !ok {
 				return errTruncated
 			}
 			ti.NewNum = v
-			data = data[n:]
+			data = rest
 		case 4:
-			v, n := decodeVarint(data)
-			if n == 0 {
+			if wtype != wireVarint {
+				return errTruncated
+			}
+			v, rest, ok := consumeVarint(data)
+			if !ok {
 				return errTruncated
 			}
 			ti.AckNum = v
-			data = data[n:]
+			data = rest
 		case 5:
-			v, n := decodeVarint(data)
-			if n == 0 {
+			if wtype != wireVarint {
+				return errTruncated
+			}
+			v, rest, ok := consumeVarint(data)
+			if !ok {
 				return errTruncated
 			}
 			ti.ThrowawayNum = v
-			data = data[n:]
+			data = rest
 		case 6:
-			length, n := decodeVarint(data)
-			if n == 0 || int(length) > len(data[n:]) {
+			if wtype != wireBytes {
 				return errTruncated
 			}
-			ti.Diff = append([]byte(nil), data[n:n+int(length)]...)
-			data = data[n+int(length):]
+			value, rest, ok := consumeBytes(data)
+			if !ok {
+				return errTruncated
+			}
+			ti.Diff = append([]byte(nil), value...)
+			data = rest
 		case 7:
-			length, n := decodeVarint(data)
-			if n == 0 || int(length) > len(data[n:]) {
+			if wtype != wireBytes {
 				return errTruncated
 			}
-			ti.Chaff = append([]byte(nil), data[n:n+int(length)]...)
-			data = data[n+int(length):]
+			value, rest, ok := consumeBytes(data)
+			if !ok {
+				return errTruncated
+			}
+			ti.Chaff = append([]byte(nil), value...)
+			data = rest
 		case 8:
-			length, n := decodeVarint(data)
-			if n == 0 || int(length) > len(data[n:]) {
+			if wtype != wireBytes {
 				return errTruncated
 			}
-			ti.LatchCaps = append([]byte(nil), data[n:n+int(length)]...)
-			data = data[n+int(length):]
+			value, rest, ok := consumeBytes(data)
+			if !ok {
+				return errTruncated
+			}
+			ti.LatchCaps = append([]byte(nil), value...)
+			data = rest
 		default:
 			skip := skipField(data, wtype)
 			if skip == 0 {
@@ -276,25 +322,33 @@ func UnmarshalHostMessage(data []byte) ([]HostInstruction, error) {
 func unmarshalHostMessage(data []byte) ([]HostInstruction, error) {
 	var instrs []HostInstruction
 	for len(data) > 0 {
-		field, _, n := decodeTag(data)
+		field, wtype, n := decodeTag(data)
 		if n == 0 {
 			return nil, errTruncated
 		}
 		data = data[n:]
 		if field != 1 {
-			return nil, errors.New("mosh/pb: unexpected field in HostMessage")
+			skip := skipField(data, wtype)
+			if skip == 0 {
+				return nil, errTruncated
+			}
+			data = data[skip:]
+			continue
 		}
-		length, n := decodeVarint(data)
-		if n == 0 || int(length) > len(data[n:]) {
+		if wtype != wireBytes {
+			return nil, errTruncated
+		}
+		value, rest, ok := consumeBytes(data)
+		if !ok {
 			return nil, errTruncated
 		}
 		var hi HostInstruction
 		hi.EchoAckNum = -1
-		if err := hi.unmarshal(data[n : n+int(length)]); err != nil {
+		if err := hi.unmarshal(value); err != nil {
 			return nil, err
 		}
 		instrs = append(instrs, hi)
-		data = data[n+int(length):]
+		data = rest
 	}
 	return instrs, nil
 }
@@ -337,43 +391,55 @@ func (hi *HostInstruction) unmarshal(data []byte) error {
 
 		switch field {
 		case 2: // HostBytes
-			length, n := decodeVarint(data)
-			if n == 0 || int(length) > len(data[n:]) {
+			if wtype != wireBytes {
 				return errTruncated
 			}
-			if err := hi.unmarshalHostBytes(data[n : n+int(length)]); err != nil {
+			value, rest, ok := consumeBytes(data)
+			if !ok {
+				return errTruncated
+			}
+			if err := hi.unmarshalHostBytes(value); err != nil {
 				return err
 			}
-			data = data[n+int(length):]
+			data = rest
 		case 3: // ResizeMessage
-			length, n := decodeVarint(data)
-			if n == 0 || int(length) > len(data[n:]) {
+			if wtype != wireBytes {
 				return errTruncated
 			}
-			if err := hi.unmarshalResize(data[n : n+int(length)]); err != nil {
+			value, rest, ok := consumeBytes(data)
+			if !ok {
+				return errTruncated
+			}
+			if err := hi.unmarshalResize(value); err != nil {
 				return err
 			}
-			data = data[n+int(length):]
+			data = rest
 		case 7: // EchoAck
-			length, n := decodeVarint(data)
-			if n == 0 || int(length) > len(data[n:]) {
+			if wtype != wireBytes {
 				return errTruncated
 			}
-			if err := hi.unmarshalEchoAck(data[n : n+int(length)]); err != nil {
+			value, rest, ok := consumeBytes(data)
+			if !ok {
+				return errTruncated
+			}
+			if err := hi.unmarshalEchoAck(value); err != nil {
 				return err
 			}
-			data = data[n+int(length):]
+			data = rest
 		case 9: // LatchControl
-			length, n := decodeVarint(data)
-			if n == 0 || int(length) > len(data[n:]) {
+			if wtype != wireBytes {
+				return errTruncated
+			}
+			value, rest, ok := consumeBytes(data)
+			if !ok {
 				return errTruncated
 			}
 			ctrl := &LatchControl{}
-			if err := ctrl.unmarshal(data[n : n+int(length)]); err != nil {
+			if err := ctrl.unmarshal(value); err != nil {
 				return err
 			}
 			hi.Control = ctrl
-			data = data[n+int(length):]
+			data = rest
 		default:
 			skip := skipField(data, wtype)
 			if skip == 0 {
@@ -393,12 +459,15 @@ func (hi *HostInstruction) unmarshalHostBytes(data []byte) error {
 		}
 		data = data[n:]
 		if field == 4 {
-			length, n := decodeVarint(data)
-			if n == 0 || int(length) > len(data[n:]) {
+			if wtype != wireBytes {
 				return errTruncated
 			}
-			hi.Hoststring = append([]byte(nil), data[n:n+int(length)]...)
-			data = data[n+int(length):]
+			value, rest, ok := consumeBytes(data)
+			if !ok {
+				return errTruncated
+			}
+			hi.Hoststring = append([]byte(nil), value...)
+			data = rest
 		} else {
 			skip := skipField(data, wtype)
 			if skip == 0 {
@@ -422,12 +491,15 @@ func (hi *HostInstruction) unmarshalEchoAck(data []byte) error {
 		}
 		data = data[n:]
 		if field == 8 {
-			v, n := decodeVarint(data)
-			if n == 0 {
+			if wtype != wireVarint {
+				return errTruncated
+			}
+			v, rest, ok := consumeVarint(data)
+			if !ok {
 				return errTruncated
 			}
 			hi.EchoAckNum = int64(v)
-			data = data[n:]
+			data = rest
 		} else {
 			skip := skipField(data, wtype)
 			if skip == 0 {
@@ -458,24 +530,32 @@ func marshalUserMessage(instrs []UserInstruction) []byte {
 func unmarshalUserMessage(data []byte) ([]UserInstruction, error) {
 	var instrs []UserInstruction
 	for len(data) > 0 {
-		field, _, n := decodeTag(data)
+		field, wtype, n := decodeTag(data)
 		if n == 0 {
 			return nil, errTruncated
 		}
 		data = data[n:]
 		if field != 1 {
-			return nil, errors.New("mosh/pb: unexpected field in UserMessage")
+			skip := skipField(data, wtype)
+			if skip == 0 {
+				return nil, errTruncated
+			}
+			data = data[skip:]
+			continue
 		}
-		length, n := decodeVarint(data)
-		if n == 0 || int(length) > len(data[n:]) {
+		if wtype != wireBytes {
+			return nil, errTruncated
+		}
+		value, rest, ok := consumeBytes(data)
+		if !ok {
 			return nil, errTruncated
 		}
 		var ui UserInstruction
-		if err := ui.unmarshal(data[n : n+int(length)]); err != nil {
+		if err := ui.unmarshal(value); err != nil {
 			return nil, err
 		}
 		instrs = append(instrs, ui)
-		data = data[n+int(length):]
+		data = rest
 	}
 	return instrs, nil
 }
@@ -513,34 +593,43 @@ func (ui *UserInstruction) unmarshal(data []byte) error {
 
 		switch field {
 		case 2: // Keystroke
-			length, n := decodeVarint(data)
-			if n == 0 || int(length) > len(data[n:]) {
+			if wtype != wireBytes {
 				return errTruncated
 			}
-			if err := ui.unmarshalKeystroke(data[n : n+int(length)]); err != nil {
+			value, rest, ok := consumeBytes(data)
+			if !ok {
+				return errTruncated
+			}
+			if err := ui.unmarshalKeystroke(value); err != nil {
 				return err
 			}
-			data = data[n+int(length):]
+			data = rest
 		case 3: // ResizeMessage
-			length, n := decodeVarint(data)
-			if n == 0 || int(length) > len(data[n:]) {
+			if wtype != wireBytes {
 				return errTruncated
 			}
-			if err := unmarshalResize(data[n:n+int(length)], &ui.Width, &ui.Height); err != nil {
+			value, rest, ok := consumeBytes(data)
+			if !ok {
+				return errTruncated
+			}
+			if err := unmarshalResize(value, &ui.Width, &ui.Height); err != nil {
 				return err
 			}
-			data = data[n+int(length):]
+			data = rest
 		case 9: // LatchControl
-			length, n := decodeVarint(data)
-			if n == 0 || int(length) > len(data[n:]) {
+			if wtype != wireBytes {
+				return errTruncated
+			}
+			value, rest, ok := consumeBytes(data)
+			if !ok {
 				return errTruncated
 			}
 			ctrl := &LatchControl{}
-			if err := ctrl.unmarshal(data[n : n+int(length)]); err != nil {
+			if err := ctrl.unmarshal(value); err != nil {
 				return err
 			}
 			ui.Control = ctrl
-			data = data[n+int(length):]
+			data = rest
 		default:
 			skip := skipField(data, wtype)
 			if skip == 0 {
@@ -560,12 +649,15 @@ func (ui *UserInstruction) unmarshalKeystroke(data []byte) error {
 		}
 		data = data[n:]
 		if field == 4 {
-			length, n := decodeVarint(data)
-			if n == 0 || int(length) > len(data[n:]) {
+			if wtype != wireBytes {
 				return errTruncated
 			}
-			ui.Keys = append(ui.Keys, data[n:n+int(length)]...)
-			data = data[n+int(length):]
+			value, rest, ok := consumeBytes(data)
+			if !ok {
+				return errTruncated
+			}
+			ui.Keys = append(ui.Keys, value...)
+			data = rest
 		} else {
 			skip := skipField(data, wtype)
 			if skip == 0 {
@@ -587,19 +679,25 @@ func unmarshalResize(data []byte, width, height *int32) error {
 		data = data[n:]
 		switch field {
 		case 5:
-			v, n := decodeVarint(data)
-			if n == 0 {
+			if wtype != wireVarint {
+				return errTruncated
+			}
+			v, rest, ok := consumeVarint(data)
+			if !ok {
 				return errTruncated
 			}
 			*width = int32(v)
-			data = data[n:]
+			data = rest
 		case 6:
-			v, n := decodeVarint(data)
-			if n == 0 {
+			if wtype != wireVarint {
+				return errTruncated
+			}
+			v, rest, ok := consumeVarint(data)
+			if !ok {
 				return errTruncated
 			}
 			*height = int32(v)
-			data = data[n:]
+			data = rest
 		default:
 			skip := skipField(data, wtype)
 			if skip == 0 {
@@ -620,19 +718,25 @@ func (c *LatchControl) unmarshal(data []byte) error {
 		data = data[n:]
 		switch field {
 		case 10:
-			v, n := decodeVarint(data)
-			if n == 0 {
+			if wtype != wireVarint {
+				return errTruncated
+			}
+			v, rest, ok := consumeVarint(data)
+			if !ok {
 				return errTruncated
 			}
 			c.Type = uint32(v)
-			data = data[n:]
+			data = rest
 		case 11:
-			length, n := decodeVarint(data)
-			if n == 0 || int(length) > len(data[n:]) {
+			if wtype != wireBytes {
 				return errTruncated
 			}
-			c.Payload = append([]byte(nil), data[n:n+int(length)]...)
-			data = data[n+int(length):]
+			value, rest, ok := consumeBytes(data)
+			if !ok {
+				return errTruncated
+			}
+			c.Payload = append([]byte(nil), value...)
+			data = rest
 		default:
 			skip := skipField(data, wtype)
 			if skip == 0 {
@@ -642,12 +746,4 @@ func (c *LatchControl) unmarshal(data []byte) error {
 		}
 	}
 	return nil
-}
-
-// varintSize returns the encoded size of a varint.
-func varintSize(v uint64) int {
-	if v == 0 {
-		return 1
-	}
-	return (bits.Len64(v) + 6) / 7
 }

@@ -84,10 +84,10 @@ func TestOCBMoshWireFormat(t *testing.T) {
 	binary.BigEndian.PutUint16(plaintext[2:], 0)     // timestamp_reply
 	copy(plaintext[4:], payload)
 
-	// Encrypt returns [tag:16][ciphertext].
+	// Encrypt returns ciphertext followed by the 16-byte tag.
 	tagAndCT := ocb.Encrypt(nonce[:], plaintext)
 
-	// Build wire format: [dirSeq:8][tag+ciphertext]
+	// Build wire format: [dirSeq:8][ciphertext+tag]
 	wire := make([]byte, 8+len(tagAndCT))
 	binary.BigEndian.PutUint64(wire[0:], dirSeq)
 	copy(wire[8:], tagAndCT)

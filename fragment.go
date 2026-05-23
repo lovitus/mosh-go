@@ -12,7 +12,7 @@ import (
 //	[fragment_num(15 bits) | final_flag(1 bit) : 2 bytes, big-endian]
 //	[payload : remaining bytes]
 //
-// fragment_num occupies the upper 15 bits; the lowest bit is the final flag.
+// final_flag occupies the highest bit; fragment_num occupies the lower 15 bits.
 
 const (
 	fragmentHeaderSize = 10 // 8 + 2
