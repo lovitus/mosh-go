@@ -63,7 +63,7 @@ type ColorType byte
 
 const (
 	ColorDefault ColorType = iota
-	ColorIndex            // 0-7 normal, 8-15 bright, 16-255 extended
+	ColorIndex             // 0-7 normal, 8-15 bright, 16-255 extended
 	ColorRGB
 )
 
@@ -144,6 +144,13 @@ func (fb *Framebuffer) Diff(old *Framebuffer) []byte {
 			}
 			curX += c.Width
 		}
+		if rowSuffixBlank(fb, y, curX) {
+			if curAttr != (Attr{}) {
+				buf = append(buf, "\033[m"...)
+				curAttr = Attr{}
+			}
+			buf = append(buf, "\033[K"...)
+		}
 	}
 
 	// Reset attributes.
@@ -160,13 +167,30 @@ func (fb *Framebuffer) Diff(old *Framebuffer) []byte {
 	return buf
 }
 
+func rowSuffixBlank(fb *Framebuffer, y, x int) bool {
+	if x < 0 || x > fb.W {
+		return false
+	}
+	rowOff := y * fb.W
+	for col := x; col < fb.W; col++ {
+		c := &fb.Cells[rowOff+col]
+		if c.Width == 0 {
+			continue
+		}
+		if (c.Rune != 0 && c.Rune != ' ') || c.Attr != (Attr{}) {
+			return false
+		}
+	}
+	return true
+}
+
 // fullRedraw produces ANSI to draw the entire screen from scratch.
 func (fb *Framebuffer) fullRedraw() []byte {
 	var buf []byte
-	buf = append(buf, "\033[?25l"...)  // hide cursor
-	buf = append(buf, "\033[H"...)     // home
-	buf = append(buf, "\033[2J"...)    // clear screen
-	buf = append(buf, "\033[m"...)     // reset attrs
+	buf = append(buf, "\033[?25l"...) // hide cursor
+	buf = append(buf, "\033[H"...)    // home
+	buf = append(buf, "\033[2J"...)   // clear screen
+	buf = append(buf, "\033[m"...)    // reset attrs
 
 	var curAttr Attr
 	for y := 0; y < fb.H; y++ {

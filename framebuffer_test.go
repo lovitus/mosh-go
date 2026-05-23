@@ -32,6 +32,48 @@ func TestFramebufferDiffSingleCell(t *testing.T) {
 	}
 }
 
+func TestFramebufferDiffClearsBlankRowSuffix(t *testing.T) {
+	old := NewFramebuffer(10, 2)
+	for i, r := range "abcdef" {
+		c := old.CellAt(i, 0)
+		c.Rune = r
+		c.Width = 1
+	}
+	fb := NewFramebuffer(10, 2)
+	for i, r := range "abc" {
+		c := fb.CellAt(i, 0)
+		c.Rune = r
+		c.Width = 1
+	}
+
+	diff := fb.Diff(old)
+	s := string(diff)
+	if !strings.Contains(s, "\033[K") {
+		t.Fatalf("diff should clear row suffix, got %q", s)
+	}
+	if !strings.Contains(s, "\033[1;4H") {
+		t.Fatalf("diff should start at first removed cell, got %q", s)
+	}
+}
+
+func TestFramebufferDiffDoesNotClearWhenNonBlankSuffixRemains(t *testing.T) {
+	old := NewFramebuffer(10, 2)
+	old.CellAt(0, 0).Rune = 'a'
+	old.CellAt(0, 0).Width = 1
+	old.CellAt(9, 0).Rune = 'z'
+	old.CellAt(9, 0).Width = 1
+	fb := NewFramebuffer(10, 2)
+	fb.CellAt(0, 0).Rune = 'b'
+	fb.CellAt(0, 0).Width = 1
+	fb.CellAt(9, 0).Rune = 'z'
+	fb.CellAt(9, 0).Width = 1
+
+	diff := fb.Diff(old)
+	if strings.Contains(string(diff), "\033[K") {
+		t.Fatalf("diff should not clear non-blank suffix, got %q", string(diff))
+	}
+}
+
 func TestFramebufferFullRedraw(t *testing.T) {
 	fb := NewFramebuffer(80, 24)
 	fb.CellAt(0, 0).Rune = 'X'
