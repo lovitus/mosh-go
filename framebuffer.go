@@ -25,11 +25,12 @@ const (
 // The server captures this from the VT emulator; the diff between
 // two Framebuffers produces the ANSI escape sequences sent as HostBytes.
 type Framebuffer struct {
-	W, H   int
-	Cells  []Cell
-	CurX   int
-	CurY   int
-	CurVis bool
+	W, H      int
+	Cells     []Cell
+	CurX      int
+	CurY      int
+	CurVis    bool
+	AltScreen bool
 }
 
 // Cell is a single character cell with SGR attributes.
@@ -99,6 +100,15 @@ func (fb *Framebuffer) Diff(old *Framebuffer) []byte {
 	if old == nil || old.W != fb.W || old.H != fb.H {
 		return fb.fullRedraw()
 	}
+	if old.AltScreen != fb.AltScreen {
+		var buf []byte
+		if fb.AltScreen {
+			buf = append(buf, "\033[?1049h"...)
+		} else {
+			buf = append(buf, "\033[?1049l"...)
+		}
+		return fb.appendFullRedraw(buf)
+	}
 
 	// Hide cursor during update.
 	buf = append(buf, "\033[?25l"...)
@@ -110,28 +120,25 @@ func (fb *Framebuffer) Diff(old *Framebuffer) []byte {
 		rowOff := y * fb.W
 		oldRowOff := y * old.W
 
-		// Find first and last changed column in this row.
-		first, last := -1, -1
+		changed := false
 		for x := 0; x < fb.W; x++ {
 			if fb.Cells[rowOff+x] != old.Cells[oldRowOff+x] {
-				if first < 0 {
-					first = x
-				}
-				last = x
+				changed = true
+				break
 			}
 		}
-		if first < 0 {
+		if !changed {
 			continue // row unchanged
 		}
 
 		// Move cursor if needed.
-		if curX != first || curY != y {
-			buf = appendCUP(buf, y, first)
-			curX, curY = first, y
+		if curX != 0 || curY != y {
+			buf = appendCUP(buf, y, 0)
+			curX, curY = 0, y
 		}
 
-		// Write changed cells.
-		for x := first; x <= last; x++ {
+		last := rowLastNonBlank(fb, y)
+		for x := 0; x <= last; x++ {
 			c := &fb.Cells[rowOff+x]
 			if c.Width == 0 {
 				continue // continuation cell of a wide char
@@ -144,7 +151,7 @@ func (fb *Framebuffer) Diff(old *Framebuffer) []byte {
 			}
 			curX += c.Width
 		}
-		if rowSuffixBlank(fb, y, curX) {
+		if curX < fb.W && rowSuffixBlank(fb, y, curX) {
 			if curAttr != (Attr{}) {
 				buf = append(buf, "\033[m"...)
 				curAttr = Attr{}
@@ -167,6 +174,20 @@ func (fb *Framebuffer) Diff(old *Framebuffer) []byte {
 	return buf
 }
 
+func rowLastNonBlank(fb *Framebuffer, y int) int {
+	rowOff := y * fb.W
+	for col := fb.W - 1; col >= 0; col-- {
+		c := &fb.Cells[rowOff+col]
+		if c.Width == 0 {
+			continue
+		}
+		if (c.Rune != 0 && c.Rune != ' ') || c.Attr != (Attr{}) {
+			return col
+		}
+	}
+	return -1
+}
+
 func rowSuffixBlank(fb *Framebuffer, y, x int) bool {
 	if x < 0 || x > fb.W {
 		return false
@@ -187,6 +208,13 @@ func rowSuffixBlank(fb *Framebuffer, y, x int) bool {
 // fullRedraw produces ANSI to draw the entire screen from scratch.
 func (fb *Framebuffer) fullRedraw() []byte {
 	var buf []byte
+	if fb.AltScreen {
+		buf = append(buf, "\033[?1049h"...)
+	}
+	return fb.appendFullRedraw(buf)
+}
+
+func (fb *Framebuffer) appendFullRedraw(buf []byte) []byte {
 	buf = append(buf, "\033[?25l"...) // hide cursor
 	buf = append(buf, "\033[H"...)    // home
 	buf = append(buf, "\033[2J"...)   // clear screen
@@ -453,6 +481,7 @@ func SnapshotEmulator(emu *vt.Emulator, cursorVisible bool) *Framebuffer {
 	fb.CurX = pos.X
 	fb.CurY = pos.Y
 	fb.CurVis = cursorVisible
+	fb.AltScreen = emu.IsAltScreen()
 
 	return fb
 }

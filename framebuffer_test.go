@@ -3,6 +3,8 @@ package mosh
 import (
 	"strings"
 	"testing"
+
+	"github.com/unixshells/vt-go"
 )
 
 func TestFramebufferDiffIdentical(t *testing.T) {
@@ -23,12 +25,33 @@ func TestFramebufferDiffSingleCell(t *testing.T) {
 
 	diff := fb.Diff(old)
 	s := string(diff)
-	// Should contain CUP to row 4, col 6 (1-indexed).
-	if !strings.Contains(s, "\033[4;6H") {
-		t.Fatalf("expected CUP \\033[4;6H, got %q", s)
+	// Changed rows are redrawn from column 1 to avoid stale row fragments.
+	if !strings.Contains(s, "\033[4;1H") {
+		t.Fatalf("expected CUP \\033[4;1H, got %q", s)
 	}
 	if !strings.Contains(s, "A") {
 		t.Fatal("diff should contain 'A'")
+	}
+}
+
+func TestFramebufferDiffRedrawsChangedRowFromColumnOne(t *testing.T) {
+	old := NewFramebuffer(10, 2)
+	for i, r := range "abcdef" {
+		c := old.CellAt(i, 0)
+		c.Rune = r
+		c.Width = 1
+	}
+	fb := NewFramebuffer(10, 2)
+	for i, r := range "abcxef" {
+		c := fb.CellAt(i, 0)
+		c.Rune = r
+		c.Width = 1
+	}
+
+	diff := fb.Diff(old)
+	s := string(diff)
+	if !strings.Contains(s, "\033[1;1Habcxef") {
+		t.Fatalf("diff should redraw changed row from column 1, got %q", s)
 	}
 }
 
@@ -51,8 +74,8 @@ func TestFramebufferDiffClearsBlankRowSuffix(t *testing.T) {
 	if !strings.Contains(s, "\033[K") {
 		t.Fatalf("diff should clear row suffix, got %q", s)
 	}
-	if !strings.Contains(s, "\033[1;4H") {
-		t.Fatalf("diff should start at first removed cell, got %q", s)
+	if !strings.Contains(s, "\033[1;1Habc") {
+		t.Fatalf("diff should redraw retained prefix, got %q", s)
 	}
 }
 
@@ -86,6 +109,68 @@ func TestFramebufferFullRedraw(t *testing.T) {
 	}
 	if !strings.Contains(s, "X") {
 		t.Fatal("full redraw should contain 'X'")
+	}
+}
+
+func TestFramebufferFullRedrawEntersAltScreenWhenActive(t *testing.T) {
+	fb := NewFramebuffer(80, 24)
+	fb.AltScreen = true
+	fb.CellAt(0, 0).Rune = 'X'
+	fb.CellAt(0, 0).Width = 1
+
+	diff := fb.Diff(nil)
+	s := string(diff)
+	if !strings.Contains(s, "\033[?1049h") {
+		t.Fatalf("full redraw should enter alternate screen, got %q", s)
+	}
+	if !strings.Contains(s, "\033[2J") || !strings.Contains(s, "X") {
+		t.Fatalf("full redraw should clear and draw content, got %q", s)
+	}
+}
+
+func TestFramebufferDiffAltScreenTransitionFullRedraws(t *testing.T) {
+	old := NewFramebuffer(80, 24)
+	fb := NewFramebuffer(80, 24)
+	fb.AltScreen = true
+	fb.CellAt(0, 0).Rune = 'T'
+	fb.CellAt(0, 0).Width = 1
+
+	diff := fb.Diff(old)
+	s := string(diff)
+	if !strings.Contains(s, "\033[?1049h") {
+		t.Fatalf("diff should enter alternate screen, got %q", s)
+	}
+	if !strings.Contains(s, "\033[2J") || !strings.Contains(s, "T") {
+		t.Fatalf("diff should full redraw alternate screen, got %q", s)
+	}
+
+	old = fb
+	normal := NewFramebuffer(80, 24)
+	normal.CellAt(0, 0).Rune = 'P'
+	normal.CellAt(0, 0).Width = 1
+	diff = normal.Diff(old)
+	s = string(diff)
+	if !strings.Contains(s, "\033[?1049l") {
+		t.Fatalf("diff should exit alternate screen, got %q", s)
+	}
+	if !strings.Contains(s, "\033[2J") || !strings.Contains(s, "P") {
+		t.Fatalf("diff should full redraw normal screen, got %q", s)
+	}
+}
+
+func TestSnapshotEmulatorCapturesAltScreenState(t *testing.T) {
+	emu := vt.NewEmulator(80, 24)
+	if _, err := emu.Write([]byte("\033[?1049h")); err != nil {
+		t.Fatal(err)
+	}
+	if fb := SnapshotEmulator(emu, true); !fb.AltScreen {
+		t.Fatal("snapshot should report alternate screen active")
+	}
+	if _, err := emu.Write([]byte("\033[?1049l")); err != nil {
+		t.Fatal(err)
+	}
+	if fb := SnapshotEmulator(emu, true); fb.AltScreen {
+		t.Fatal("snapshot should report normal screen after alternate screen reset")
 	}
 }
 
