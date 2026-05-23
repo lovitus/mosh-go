@@ -394,6 +394,68 @@ func TestServerTakeoverRequiresFreshKey(t *testing.T) {
 	}
 }
 
+func TestServerPrepareTakeoverDoesNotInvalidateCurrentClient(t *testing.T) {
+	conn := newMemoryPacketConn(PacketAddr("127.0.0.1:60005"))
+	srv, err := NewServerConn("/bin/sh", conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	out := make(chan UserInstruction, 8)
+	go srv.recvUDP(out)
+
+	oldOCB, err := NewOCB(srv.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldClient := NewTransport(oldOCB, false)
+	oldAddr := PacketAddr("old-client:1")
+	oldClient.ForceNextSend()
+	conn.inject(oldAddr, oldClient.Tick()[0])
+	waitForAddr(t, srv, oldAddr, true)
+	_, oldGen := srv.currentTransport()
+
+	prepared, err := srv.PrepareTakeover()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared.KeyBase64() == "" {
+		t.Fatal("prepared takeover returned empty key")
+	}
+	if !srv.isCurrentTransport(oldGen) {
+		t.Fatal("preparing takeover invalidated current transport")
+	}
+
+	oldClient.SetPending(marshalUserMessage([]UserInstruction{{Keys: []byte("old-before-commit")}}))
+	for _, dg := range oldClient.Tick() {
+		conn.inject(oldAddr, dg)
+	}
+	waitForAddr(t, srv, oldAddr, true)
+	select {
+	case ui := <-out:
+		if string(ui.Keys) != "old-before-commit" {
+			t.Fatalf("keys = %q, want old-before-commit", ui.Keys)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for old client before commit")
+	}
+
+	if err := srv.CommitTakeover(prepared); err != nil {
+		t.Fatal(err)
+	}
+	if srv.isCurrentTransport(oldGen) {
+		t.Fatal("old transport generation is still current after commit")
+	}
+	waitForAddr(t, srv, oldAddr, false)
+
+	oldClient.SetPending(marshalUserMessage([]UserInstruction{{Keys: []byte("old-after-commit")}}))
+	for _, dg := range oldClient.Tick() {
+		conn.inject(oldAddr, dg)
+	}
+	waitForAddr(t, srv, oldAddr, false)
+}
+
 func TestServerNetworkTimeoutConfig(t *testing.T) {
 	conn := newMemoryPacketConn(PacketAddr("127.0.0.1:60004"))
 	srv, err := NewServerConn("/bin/sh", conn)

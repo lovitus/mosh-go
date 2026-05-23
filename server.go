@@ -189,36 +189,79 @@ func (s *Server) SetNetworkTimeout(timeout time.Duration) {
 	s.mu.Unlock()
 }
 
-// Takeover resets the client association and transport key while keeping the
-// existing PTY/shell and terminal state alive. It is intended for a trusted
-// control plane that wants a fresh client process to attach to an existing
-// server session without reusing old SSP sequence numbers.
-func (s *Server) Takeover() (string, error) {
+// PreparedTakeover holds a generated key/transport association that can later
+// be committed by a trusted control plane. Preparing does not affect the
+// currently attached client.
+type PreparedTakeover struct {
+	key    []byte
+	keyB64 string
+	ocb    *OCB
+}
+
+// KeyBase64 returns the prepared mosh key as a base64 string without padding.
+func (t *PreparedTakeover) KeyBase64() string {
+	if t == nil {
+		return ""
+	}
+	return t.keyB64
+}
+
+// PrepareTakeover generates a fresh client association without applying it.
+// Call CommitTakeover only after the replacement attach channel is ready.
+func (s *Server) PrepareTakeover() (*PreparedTakeover, error) {
 	key, keyB64, err := GenerateKey()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	ocb, err := NewOCB(key)
 	if err != nil {
-		return "", err
+		return nil, err
+	}
+	return &PreparedTakeover{
+		key:    append([]byte(nil), key...),
+		keyB64: strings.TrimRight(keyB64, "="),
+		ocb:    ocb,
+	}, nil
+}
+
+// CommitTakeover applies a prepared association while keeping the existing
+// PTY/shell and terminal state alive.
+func (s *Server) CommitTakeover(t *PreparedTakeover) error {
+	if t == nil || len(t.key) == 0 || t.ocb == nil {
+		return fmt.Errorf("prepared takeover is nil")
 	}
 
 	s.mu.Lock()
-	s.key = key
-	s.ocb = ocb
+	s.key = append([]byte(nil), t.key...)
+	s.ocb = t.ocb
 	s.clientAddr = nil
 	s.mu.Unlock()
 
 	s.transportMu.Lock()
 	s.transportGen++
-	s.transport = NewTransport(ocb, true)
+	s.transport = NewTransport(t.ocb, true)
 	s.transportMu.Unlock()
 
 	select {
 	case s.forceRefresh <- struct{}{}:
 	default:
 	}
-	return strings.TrimRight(keyB64, "="), nil
+	return nil
+}
+
+// Takeover resets the client association and transport key while keeping the
+// existing PTY/shell and terminal state alive. It is intended for a trusted
+// control plane that wants a fresh client process to attach to an existing
+// server session without reusing old SSP sequence numbers.
+func (s *Server) Takeover() (string, error) {
+	prepared, err := s.PrepareTakeover()
+	if err != nil {
+		return "", err
+	}
+	if err := s.CommitTakeover(prepared); err != nil {
+		return "", err
+	}
+	return prepared.KeyBase64(), nil
 }
 
 func (s *Server) currentTransport() (*Transport, uint64) {
