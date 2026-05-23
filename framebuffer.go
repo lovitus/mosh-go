@@ -25,12 +25,14 @@ const (
 // The server captures this from the VT emulator; the diff between
 // two Framebuffers produces the ANSI escape sequences sent as HostBytes.
 type Framebuffer struct {
-	W, H      int
-	Cells     []Cell
-	CurX      int
-	CurY      int
-	CurVis    bool
-	AltScreen bool
+	W, H          int
+	Cells         []Cell
+	CurX          int
+	CurY          int
+	CurVis        bool
+	AltScreen     bool
+	AppCursorKeys bool
+	AppKeypad     bool
 }
 
 // Cell is a single character cell with SGR attributes.
@@ -96,17 +98,21 @@ func (fb *Framebuffer) CellAt(x, y int) *Cell {
 func (fb *Framebuffer) Diff(old *Framebuffer) []byte {
 	var buf []byte
 
-	// If dimensions changed, send a full redraw.
-	if old == nil || old.W != fb.W || old.H != fb.H {
+	if old == nil {
 		return fb.fullRedraw()
 	}
+	buf = fb.appendModeDiff(buf, old)
 	if old.AltScreen != fb.AltScreen {
-		var buf []byte
 		if fb.AltScreen {
 			buf = append(buf, "\033[?1049h"...)
 		} else {
 			buf = append(buf, "\033[?1049l"...)
 		}
+		return fb.appendFullRedraw(buf)
+	}
+
+	// If dimensions changed, send a full redraw.
+	if old.W != fb.W || old.H != fb.H {
 		return fb.appendFullRedraw(buf)
 	}
 
@@ -208,10 +214,35 @@ func rowSuffixBlank(fb *Framebuffer, y, x int) bool {
 // fullRedraw produces ANSI to draw the entire screen from scratch.
 func (fb *Framebuffer) fullRedraw() []byte {
 	var buf []byte
+	buf = fb.appendModeDiff(buf, nil)
 	if fb.AltScreen {
 		buf = append(buf, "\033[?1049h"...)
 	}
 	return fb.appendFullRedraw(buf)
+}
+
+func (fb *Framebuffer) appendModeDiff(buf []byte, old *Framebuffer) []byte {
+	oldAppCursorKeys := false
+	oldAppKeypad := false
+	if old != nil {
+		oldAppCursorKeys = old.AppCursorKeys
+		oldAppKeypad = old.AppKeypad
+	}
+	if oldAppCursorKeys != fb.AppCursorKeys {
+		if fb.AppCursorKeys {
+			buf = append(buf, "\033[?1h"...)
+		} else {
+			buf = append(buf, "\033[?1l"...)
+		}
+	}
+	if oldAppKeypad != fb.AppKeypad {
+		if fb.AppKeypad {
+			buf = append(buf, "\033="...)
+		} else {
+			buf = append(buf, "\033>"...)
+		}
+	}
+	return buf
 }
 
 func (fb *Framebuffer) appendFullRedraw(buf []byte) []byte {
@@ -433,6 +464,12 @@ func encodeRune(buf []byte, r rune) int {
 
 // SnapshotEmulator captures the VT emulator state into a Framebuffer.
 func SnapshotEmulator(emu *vt.Emulator, cursorVisible bool) *Framebuffer {
+	return SnapshotEmulatorWithModes(emu, cursorVisible, false, false)
+}
+
+// SnapshotEmulatorWithModes captures the VT emulator state and externally
+// tracked terminal input modes into a Framebuffer.
+func SnapshotEmulatorWithModes(emu *vt.Emulator, cursorVisible, appCursorKeys, appKeypad bool) *Framebuffer {
 	w := emu.Width()
 	h := emu.Height()
 	fb := NewFramebuffer(w, h)
@@ -482,6 +519,8 @@ func SnapshotEmulator(emu *vt.Emulator, cursorVisible bool) *Framebuffer {
 	fb.CurY = pos.Y
 	fb.CurVis = cursorVisible
 	fb.AltScreen = emu.IsAltScreen()
+	fb.AppCursorKeys = appCursorKeys
+	fb.AppKeypad = appKeypad
 
 	return fb
 }

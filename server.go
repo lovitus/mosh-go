@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/creack/pty"
 	"github.com/unixshells/vt-go"
 )
@@ -58,6 +59,8 @@ type Server struct {
 	baseFB     *Framebuffer // what client has (last-acked)
 	sentFB     *Framebuffer // what we last sent (pending ack)
 	curVisible atomic.Bool
+	appCursor  atomic.Bool
+	appKeypad  atomic.Bool
 
 	// Remote client address — set only from authenticated datagrams.
 	mu         sync.Mutex
@@ -308,9 +311,7 @@ func (s *Server) Serve() error {
 
 	s.emu = vt.NewEmulator(s.cols, s.rows)
 	s.curVisible.Store(true)
-	s.emu.SetCallbacks(vt.Callbacks{
-		CursorVisibility: func(visible bool) { s.curVisible.Store(visible) },
-	})
+	s.installEmulatorCallbacks()
 	s.baseFB = NewFramebuffer(s.cols, s.rows)
 
 	var wg sync.WaitGroup
@@ -378,9 +379,7 @@ func (s *Server) ServeRW(rw io.ReadWriteCloser, resize func(cols, rows uint16)) 
 
 	s.emu = vt.NewEmulator(s.cols, s.rows)
 	s.curVisible.Store(true)
-	s.emu.SetCallbacks(vt.Callbacks{
-		CursorVisibility: func(visible bool) { s.curVisible.Store(visible) },
-	})
+	s.installEmulatorCallbacks()
 	s.baseFB = NewFramebuffer(s.cols, s.rows)
 
 	var wg sync.WaitGroup
@@ -414,6 +413,43 @@ func (s *Server) ServeRW(rw io.ReadWriteCloser, resize func(cols, rows uint16)) 
 	s.closeEmulator()
 	wg.Wait()
 	return nil
+}
+
+func (s *Server) installEmulatorCallbacks() {
+	s.appCursor.Store(false)
+	s.appKeypad.Store(false)
+	s.emu.SetCallbacks(vt.Callbacks{
+		CursorVisibility: func(visible bool) { s.curVisible.Store(visible) },
+		EnableMode:       s.setTrackedMode,
+		DisableMode:      s.clearTrackedMode,
+	})
+}
+
+func (s *Server) setTrackedMode(mode ansi.Mode) {
+	switch mode {
+	case ansi.ModeCursorKeys:
+		s.appCursor.Store(true)
+	case ansi.ModeNumericKeypad:
+		s.appKeypad.Store(true)
+	}
+}
+
+func (s *Server) clearTrackedMode(mode ansi.Mode) {
+	switch mode {
+	case ansi.ModeCursorKeys:
+		s.appCursor.Store(false)
+	case ansi.ModeNumericKeypad:
+		s.appKeypad.Store(false)
+	}
+}
+
+func (s *Server) snapshotEmulator() *Framebuffer {
+	return SnapshotEmulatorWithModes(
+		s.emu,
+		s.curVisible.Load(),
+		s.appCursor.Load(),
+		s.appKeypad.Load(),
+	)
 }
 
 func (s *Server) forwardTerminalResponses(w io.Writer) {
@@ -525,7 +561,7 @@ func (s *Server) mainLoopRW(rw io.Writer, resize func(cols, rows uint16), ioOutp
 			}
 
 			if dirty {
-				currentFB := SnapshotEmulator(s.emu, s.curVisible.Load())
+				currentFB := s.snapshotEmulator()
 				diffBytes := currentFB.Diff(s.baseFB)
 				if len(diffBytes) > 0 {
 					hi := HostInstruction{Hoststring: diffBytes, EchoAckNum: -1}
@@ -575,7 +611,7 @@ func (s *Server) queueFullRefresh() {
 	if s.emu == nil {
 		return
 	}
-	currentFB := SnapshotEmulator(s.emu, s.curVisible.Load())
+	currentFB := s.snapshotEmulator()
 	s.mu.Lock()
 	cols, rows := s.cols, s.rows
 	s.mu.Unlock()
@@ -663,7 +699,7 @@ func (s *Server) mainLoop(ptyOutput <-chan []byte, userInput <-chan UserInstruct
 			}
 
 			if dirty {
-				currentFB := SnapshotEmulator(s.emu, s.curVisible.Load())
+				currentFB := s.snapshotEmulator()
 				diffBytes := currentFB.Diff(s.baseFB)
 				if len(diffBytes) > 0 {
 					hi := HostInstruction{Hoststring: diffBytes, EchoAckNum: -1}

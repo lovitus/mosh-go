@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/unixshells/vt-go"
 )
 
@@ -53,5 +54,41 @@ func TestForwardTerminalResponsesUnblocksTerminalQueries(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("did not forward terminal query response")
+	}
+}
+
+func TestEmulatorCallbacksTrackTerminalInputModes(t *testing.T) {
+	srv := &Server{
+		emu: vt.NewEmulator(80, 24),
+	}
+	srv.installEmulatorCallbacks()
+
+	if _, err := srv.emu.Write([]byte("\x1b[?1h\x1b=")); err != nil {
+		t.Fatal(err)
+	}
+	fb := srv.snapshotEmulator()
+	if !fb.AppCursorKeys {
+		t.Fatal("snapshot should track application cursor keys")
+	}
+	if !fb.AppKeypad {
+		t.Fatal("snapshot should track application keypad")
+	}
+
+	if _, err := srv.emu.Write([]byte("\x1b[?1l\x1b>")); err != nil {
+		t.Fatal(err)
+	}
+	fb = srv.snapshotEmulator()
+	if fb.AppCursorKeys {
+		t.Fatal("snapshot should track normal cursor keys")
+	}
+	if fb.AppKeypad {
+		t.Fatal("snapshot should track numeric keypad")
+	}
+
+	srv.setTrackedMode(ansi.ModeCursorKeys)
+	srv.setTrackedMode(ansi.ModeNumericKeypad)
+	fb = srv.snapshotEmulator()
+	if !fb.AppCursorKeys || !fb.AppKeypad {
+		t.Fatal("direct mode callbacks should update tracked modes")
 	}
 }

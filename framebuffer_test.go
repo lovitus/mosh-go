@@ -158,6 +158,45 @@ func TestFramebufferDiffAltScreenTransitionFullRedraws(t *testing.T) {
 	}
 }
 
+func TestFramebufferDiffTerminalInputModes(t *testing.T) {
+	old := NewFramebuffer(80, 24)
+	fb := NewFramebuffer(80, 24)
+	fb.AppCursorKeys = true
+	fb.AppKeypad = true
+
+	diff := fb.Diff(old)
+	s := string(diff)
+	if !strings.Contains(s, "\033[?1h") {
+		t.Fatalf("diff should enable application cursor keys, got %q", s)
+	}
+	if !strings.Contains(s, "\033=") {
+		t.Fatalf("diff should enable application keypad, got %q", s)
+	}
+
+	old = fb
+	normal := NewFramebuffer(80, 24)
+	diff = normal.Diff(old)
+	s = string(diff)
+	if !strings.Contains(s, "\033[?1l") {
+		t.Fatalf("diff should disable application cursor keys, got %q", s)
+	}
+	if !strings.Contains(s, "\033>") {
+		t.Fatalf("diff should disable application keypad, got %q", s)
+	}
+}
+
+func TestFramebufferFullRedrawIncludesTerminalInputModes(t *testing.T) {
+	fb := NewFramebuffer(80, 24)
+	fb.AppCursorKeys = true
+	fb.AppKeypad = true
+
+	diff := fb.Diff(nil)
+	s := string(diff)
+	if !strings.Contains(s, "\033[?1h") || !strings.Contains(s, "\033=") {
+		t.Fatalf("full redraw should include terminal input modes, got %q", s)
+	}
+}
+
 func TestSnapshotEmulatorCapturesAltScreenState(t *testing.T) {
 	emu := vt.NewEmulator(80, 24)
 	if _, err := emu.Write([]byte("\033[?1049h")); err != nil {
