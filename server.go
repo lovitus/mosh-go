@@ -314,7 +314,7 @@ func (s *Server) Serve() error {
 	s.baseFB = NewFramebuffer(s.cols, s.rows)
 
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 
 	// PTY reader: reads shell output into pending buffer.
 	ptyOutput := make(chan []byte, 64)
@@ -336,10 +336,19 @@ func (s *Server) Serve() error {
 		s.mainLoop(ptyOutput, userInput)
 	}()
 
+	// Terminal applications may query the terminal through escape sequences
+	// such as CPR (ESC[6n). vt-go emits those replies on the emulator input
+	// pipe; forward them back to the PTY so full-screen programs don't block.
+	go func() {
+		defer wg.Done()
+		s.forwardTerminalResponses(s.ptmx)
+	}()
+
 	err = s.cmd.Wait()
 	close(s.done)
 	s.ptmx.Close()
 	s.conn.Close()
+	s.closeEmulator()
 	wg.Wait()
 	return err
 }
@@ -375,7 +384,7 @@ func (s *Server) ServeRW(rw io.ReadWriteCloser, resize func(cols, rows uint16)) 
 	s.baseFB = NewFramebuffer(s.cols, s.rows)
 
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 
 	ioOutput := make(chan []byte, 64)
 	go func() {
@@ -394,11 +403,35 @@ func (s *Server) ServeRW(rw io.ReadWriteCloser, resize func(cols, rows uint16)) 
 		s.mainLoopRW(rw, resize, ioOutput, userInput)
 	}()
 
+	go func() {
+		defer wg.Done()
+		s.forwardTerminalResponses(rw)
+	}()
+
 	<-s.done
 	rw.Close()
 	s.conn.Close()
+	s.closeEmulator()
 	wg.Wait()
 	return nil
+}
+
+func (s *Server) forwardTerminalResponses(w io.Writer) {
+	buf := make([]byte, 1024)
+	for {
+		n, err := s.emu.Read(buf)
+		if n > 0 {
+			_, _ = w.Write(buf[:n])
+		}
+		if err != nil {
+			return
+		}
+		select {
+		case <-s.done:
+			return
+		default:
+		}
+	}
 }
 
 func (s *Server) readIO(r io.Reader, out chan<- []byte) {
@@ -528,6 +561,13 @@ func (s *Server) Close() {
 	s.conn.Close()
 	if s.ptmx != nil {
 		s.ptmx.Close()
+	}
+	s.closeEmulator()
+}
+
+func (s *Server) closeEmulator() {
+	if s.emu != nil {
+		_ = s.emu.Close()
 	}
 }
 
