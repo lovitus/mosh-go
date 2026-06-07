@@ -35,6 +35,9 @@ type Transport struct {
 	hasPendingBase bool     // true = diffOldNum is locked
 	pendingDataAck bool     // true = send ack ASAP (received data, not just ack)
 
+	sendCacheValid     bool
+	sendCacheFragments []Fragment
+
 	// Incoming state — list of received state nums for old_num validation.
 	receivedNums        []uint64 // ordered list of state nums we have
 	ackNum              uint64   // latest received state num
@@ -107,7 +110,8 @@ func NewTransport(ocb *OCB, isServer bool) *Transport {
 
 func (t *Transport) SetCaps(caps []byte) {
 	t.mu.Lock()
-	t.localCaps = caps
+	t.localCaps = append([]byte(nil), caps...)
+	t.clearSendCacheLocked()
 	t.mu.Unlock()
 }
 
@@ -142,8 +146,13 @@ func (t *Transport) SetPending(diff []byte) {
 	t.mu.Lock()
 	if len(diff) > 0 {
 		t.diffSent = false
+		t.pendingDiff = append([]byte(nil), diff...)
+	} else {
+		t.pendingDiff = nil
+		t.diffSent = false
+		t.hasPendingBase = false
 	}
-	t.pendingDiff = diff
+	t.clearSendCacheLocked()
 	t.mu.Unlock()
 }
 
@@ -197,10 +206,7 @@ func (t *Transport) Tick() [][]byte {
 	t.sentAckNum = t.ackNum
 	// Do NOT nil pendingDiff — keep for retransmission until server acks.
 
-	// Marshal → compress → fragment → encrypt.
-	pbData := ti.Marshal()
-	compressed := zlibCompress(pbData)
-	frags := Fragmentize(t.sentNum, compressed)
+	frags := t.fragmentsForSendLocked(ti, haveDiff)
 
 	var datagrams [][]byte
 	for i := range frags {
@@ -321,6 +327,7 @@ func (t *Transport) Recv(wire []byte) (RecvResult, error) {
 			t.pendingDiff = nil
 			t.diffSent = false
 			t.hasPendingBase = false
+			t.clearSendCacheLocked()
 		}
 	}
 
@@ -373,6 +380,7 @@ func (t *Transport) Recv(wire []byte) (RecvResult, error) {
 	// Only acknowledge states that extend the latest received state.
 	if latest {
 		t.ackNum = ti.NewNum
+		t.clearSendCacheLocked()
 	}
 
 	// Trigger immediate ack when we receive data.
@@ -382,6 +390,26 @@ func (t *Transport) Recv(wire []byte) (RecvResult, error) {
 
 	result.Diff = ti.Diff
 	return result, nil
+}
+
+func (t *Transport) clearSendCacheLocked() {
+	t.sendCacheValid = false
+	t.sendCacheFragments = nil
+}
+
+func (t *Transport) fragmentsForSendLocked(ti TransportInstruction, cacheable bool) []Fragment {
+	if cacheable && t.sendCacheValid {
+		return t.sendCacheFragments
+	}
+
+	pbData := ti.Marshal()
+	compressed := zlibCompress(pbData)
+	frags := Fragmentize(ti.NewNum, compressed)
+	if cacheable {
+		t.sendCacheFragments = frags
+		t.sendCacheValid = true
+	}
+	return frags
 }
 
 func (t *Transport) addSentStateLocked(num uint64) {
@@ -431,6 +459,7 @@ func (t *Transport) processSentStateAckLocked(ack uint64) {
 		kept = append(kept, ack)
 	}
 	t.sentStateNums = kept
+	t.clearSendCacheLocked()
 }
 
 func (t *Transport) throwawayNumForSendLocked() uint64 {
@@ -562,12 +591,20 @@ func (t *Transport) updateRTT(tsReply uint16) {
 	}
 }
 
+var zlibWriterPool = sync.Pool{
+	New: func() any {
+		return zlib.NewWriter(io.Discard)
+	},
+}
+
 // zlibCompress compresses data with zlib (default level).
 func zlibCompress(data []byte) []byte {
 	var buf bytes.Buffer
-	w := zlib.NewWriter(&buf)
-	w.Write(data)
-	w.Close()
+	w := zlibWriterPool.Get().(*zlib.Writer)
+	w.Reset(&buf)
+	_, _ = w.Write(data)
+	_ = w.Close()
+	zlibWriterPool.Put(w)
 	return buf.Bytes()
 }
 

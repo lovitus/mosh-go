@@ -231,12 +231,20 @@ func (c *Client) tick() {
 	// increment sentNum for the same cumulative payload — the server
 	// applies duplicate keystrokes.
 	c.actionsMu.Lock()
+	c.processAcksLocked()
 	if c.dirty && c.transport.AckedByRemote() >= c.transport.SentNum() {
-		c.dirty = false
-		c.processAcksLocked()
-		newActions := c.actions[c.ackedActionCount:]
-		c.transport.SetPending(MarshalUserMessage(newActions))
-		c.sentActionCounts[c.transport.SentNum()+1] = len(c.actions)
+		start := c.ackedActionCount
+		if start > len(c.actions) {
+			start = len(c.actions)
+		}
+		newActions := c.actions[start:]
+		if len(newActions) > 0 {
+			c.dirty = false
+			c.transport.SetPending(MarshalUserMessage(newActions))
+			c.sentActionCounts[c.transport.SentNum()+1] = len(c.actions)
+		} else {
+			c.dirty = false
+		}
 	}
 	c.actionsMu.Unlock()
 
@@ -249,14 +257,22 @@ func (c *Client) processAcksLocked() {
 	acked := c.transport.AckedByRemote()
 	if acked > c.lastAcked {
 		c.lastAcked = acked
-		// Only advance base when server caught up (no states in flight).
-		if acked >= c.transport.SentNum() {
-			if count, ok := c.sentActionCounts[acked]; ok && count > c.ackedActionCount {
-				c.ackedActionCount = count
-			}
-			c.sentActionCounts = make(map[uint64]int)
-		}
 	}
+
+	// Only advance base when server caught up (no states in flight).
+	if acked < c.transport.SentNum() {
+		return
+	}
+	count, ok := c.sentActionCounts[acked]
+	if !ok {
+		return
+	}
+	if count > len(c.actions) {
+		count = len(c.actions)
+	}
+	c.actions = append([]UserInstruction(nil), c.actions[count:]...)
+	c.ackedActionCount = 0
+	c.sentActionCounts = make(map[uint64]int)
 }
 
 func (c *Client) recvLoop() {

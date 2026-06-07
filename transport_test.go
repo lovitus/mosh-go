@@ -288,6 +288,184 @@ func TestTransportThrowawayNumDoesNotDiscardPendingBase(t *testing.T) {
 	}
 }
 
+func samePayloadBacking(a, b []byte) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return len(a) == len(b)
+	}
+	return &a[0] == &b[0]
+}
+
+func TestTransportPendingDiffRetransmitUsesSendCache(t *testing.T) {
+	server, client := newTestPair(t)
+
+	server.SetPending([]byte("cache me"))
+	first := server.Tick()
+	if len(first) == 0 {
+		t.Fatal("no first datagram")
+	}
+	ti := decodeInstructionFromWire(t, client, first[0])
+	if ti.NewNum != 1 {
+		t.Fatalf("first newNum = %d, want 1", ti.NewNum)
+	}
+	server.mu.Lock()
+	if !server.sendCacheValid || len(server.sendCacheFragments) == 0 {
+		t.Fatal("send cache was not populated")
+	}
+	cachedPayload := server.sendCacheFragments[0].Payload
+	cachedID := server.sendCacheFragments[0].ID
+	server.mu.Unlock()
+	if cachedID != 1 {
+		t.Fatalf("cached fragment id = %d, want 1", cachedID)
+	}
+
+	server.ForceNextSend()
+	retry := server.Tick()
+	if len(retry) == 0 {
+		t.Fatal("no retry datagram")
+	}
+
+	server.mu.Lock()
+	if !server.sendCacheValid || len(server.sendCacheFragments) == 0 {
+		t.Fatal("send cache was not retained")
+	}
+	if !samePayloadBacking(cachedPayload, server.sendCacheFragments[0].Payload) {
+		t.Fatal("retry rebuilt compressed payload instead of using cache")
+	}
+	seqOut := server.seqOut
+	server.mu.Unlock()
+	if seqOut != 2 {
+		t.Fatalf("seqOut = %d, want 2", seqOut)
+	}
+	if binary.BigEndian.Uint64(first[0][:8]) == binary.BigEndian.Uint64(retry[0][:8]) {
+		t.Fatal("retry reused encrypted datagram sequence")
+	}
+	if diff := recvDiff(t, client, retry[0]); !bytes.Equal(diff, []byte("cache me")) {
+		t.Fatalf("retry diff = %q, want cache me", diff)
+	}
+}
+
+func TestTransportSendCacheInvalidationPoints(t *testing.T) {
+	server, client := newTestPair(t)
+
+	server.SetPending([]byte("payload"))
+	if len(server.Tick()) == 0 {
+		t.Fatal("no datagram")
+	}
+	server.mu.Lock()
+	if !server.sendCacheValid {
+		t.Fatal("send cache was not populated")
+	}
+	server.mu.Unlock()
+
+	caps := []byte{CapSessionControl}
+	server.SetCaps(caps)
+	caps[0] = 0
+	server.mu.Lock()
+	if !bytes.Equal(server.localCaps, []byte{CapSessionControl}) {
+		t.Fatalf("localCaps = %x, want copied CapSessionControl", server.localCaps)
+	}
+	if server.sendCacheValid {
+		t.Fatal("SetCaps did not invalidate send cache")
+	}
+	server.mu.Unlock()
+
+	server.ForceNextSend()
+	if len(server.Tick()) == 0 {
+		t.Fatal("no datagram after SetCaps")
+	}
+	server.mu.Lock()
+	if !server.sendCacheValid {
+		t.Fatal("send cache was not rebuilt")
+	}
+	server.mu.Unlock()
+
+	wire := wireInstructionForTest(t, client, 1, TransportInstruction{
+		ProtocolVersion: moshProtocolVersion,
+		OldNum:          0,
+		NewNum:          1,
+		Diff:            []byte("client-state"),
+	})
+	if _, err := server.Recv(wire); err != nil {
+		t.Fatal(err)
+	}
+	server.mu.Lock()
+	if server.ackNum != 1 {
+		t.Fatalf("ackNum = %d, want 1", server.ackNum)
+	}
+	if server.sendCacheValid {
+		t.Fatal("ackNum update did not invalidate send cache")
+	}
+	server.mu.Unlock()
+
+	server.ForceNextSend()
+	if len(server.Tick()) == 0 {
+		t.Fatal("no datagram after ackNum update")
+	}
+	server.mu.Lock()
+	if !server.sendCacheValid {
+		t.Fatal("send cache was not rebuilt after ackNum update")
+	}
+	server.processSentStateAckLocked(1)
+	if server.sendCacheValid {
+		t.Fatal("sentStateNums update did not invalidate send cache")
+	}
+	server.mu.Unlock()
+
+	server.ForceNextSend()
+	if len(server.Tick()) == 0 {
+		t.Fatal("no datagram after sent-state ack")
+	}
+	server.mu.Lock()
+	if !server.sendCacheValid {
+		t.Fatal("send cache was not rebuilt after sent-state ack")
+	}
+	server.mu.Unlock()
+
+	wire = wireInstructionForTest(t, client, 2, TransportInstruction{
+		ProtocolVersion: moshProtocolVersion,
+		OldNum:          1,
+		NewNum:          2,
+		AckNum:          server.SentNum(),
+	})
+	if _, err := server.Recv(wire); err != nil {
+		t.Fatal(err)
+	}
+	server.mu.Lock()
+	if server.pendingDiff != nil {
+		t.Fatalf("pendingDiff still set: %q", server.pendingDiff)
+	}
+	if server.sendCacheValid || server.sendCacheFragments != nil {
+		t.Fatal("acked pending diff did not release send cache")
+	}
+	server.mu.Unlock()
+}
+
+func TestTransportSetPendingCopiesInputAndHeartbeatDoesNotCache(t *testing.T) {
+	server, client := newTestPair(t)
+
+	diff := []byte("original")
+	server.SetPending(diff)
+	diff[0] = 'X'
+	datagrams := server.Tick()
+	if len(datagrams) == 0 {
+		t.Fatal("no datagram")
+	}
+	if got := recvDiff(t, client, datagrams[0]); !bytes.Equal(got, []byte("original")) {
+		t.Fatalf("diff = %q, want original", got)
+	}
+
+	server, _ = newTestPair(t)
+	server.ForceNextSend()
+	if len(server.Tick()) == 0 {
+		t.Fatal("no heartbeat datagram")
+	}
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if server.sendCacheValid || server.sendCacheFragments != nil {
+		t.Fatal("heartbeat should not populate send cache")
+	}
+}
+
 func TestTransportRejectsProtocolVersionMismatch(t *testing.T) {
 	server, client := newTestPair(t)
 

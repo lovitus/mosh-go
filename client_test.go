@@ -363,6 +363,120 @@ func TestFastTypingNoDuplication(t *testing.T) {
 	}
 }
 
+type recordingConn struct {
+	mu     sync.Mutex
+	writes [][]byte
+}
+
+func (c *recordingConn) Read(b []byte) (int, error) { return 0, io.EOF }
+
+func (c *recordingConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.writes = append(c.writes, append([]byte(nil), b...))
+	return len(b), nil
+}
+
+func (c *recordingConn) SetReadDeadline(t time.Time) error { return nil }
+func (c *recordingConn) Close() error                      { return nil }
+
+func newActionTestClient(t *testing.T) (*Client, *recordingConn) {
+	t.Helper()
+	ocb, err := NewOCB(make([]byte, 16))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &recordingConn{}
+	client := &Client{
+		conn:             conn,
+		transport:        NewTransport(ocb, false),
+		outputC:          make(chan struct{}, 1),
+		done:             make(chan struct{}),
+		sentActionCounts: make(map[uint64]int),
+	}
+	return client, conn
+}
+
+func setClientTransportAckState(c *Client, sent, acked uint64) {
+	c.transport.mu.Lock()
+	c.transport.sentNum = sent
+	c.transport.ackedByRemote = acked
+	c.transport.sentStateNums = []uint64{sent}
+	c.transport.mu.Unlock()
+}
+
+func TestClientTickCompactsAckedActionsWithoutDirty(t *testing.T) {
+	client, _ := newActionTestClient(t)
+	client.actions = []UserInstruction{{Keys: []byte("a")}, {Keys: []byte("b")}}
+	client.sentActionCounts[1] = 2
+	setClientTransportAckState(client, 1, 1)
+
+	client.tick()
+
+	if len(client.actions) != 0 {
+		t.Fatalf("actions len = %d, want 0", len(client.actions))
+	}
+	if client.ackedActionCount != 0 {
+		t.Fatalf("ackedActionCount = %d, want 0", client.ackedActionCount)
+	}
+	if len(client.sentActionCounts) != 0 {
+		t.Fatalf("sentActionCounts = %v, want empty", client.sentActionCounts)
+	}
+}
+
+func TestClientTickCompactsAndSendsRemainingDirtyActions(t *testing.T) {
+	client, conn := newActionTestClient(t)
+	client.actions = []UserInstruction{
+		{Keys: []byte("acked")},
+		{Keys: []byte("pending")},
+	}
+	client.sentActionCounts[1] = 1
+	client.dirty = true
+	setClientTransportAckState(client, 1, 1)
+
+	client.tick()
+
+	if len(client.actions) != 1 || string(client.actions[0].Keys) != "pending" {
+		t.Fatalf("actions = %+v, want only pending action", client.actions)
+	}
+	if client.dirty {
+		t.Fatal("dirty should be false after sending remaining action")
+	}
+	if got := client.sentActionCounts[2]; got != 1 {
+		t.Fatalf("sentActionCounts[2] = %d, want 1", got)
+	}
+	client.transport.mu.Lock()
+	sentNum := client.transport.sentNum
+	client.transport.mu.Unlock()
+	if sentNum != 2 {
+		t.Fatalf("sentNum = %d, want 2", sentNum)
+	}
+	conn.mu.Lock()
+	writes := len(conn.writes)
+	conn.mu.Unlock()
+	if writes == 0 {
+		t.Fatal("expected remaining action to be written")
+	}
+}
+
+func TestClientTickDoesNotCompactUnknownOrPartialAck(t *testing.T) {
+	client, _ := newActionTestClient(t)
+	client.actions = []UserInstruction{{Keys: []byte("keep")}}
+	setClientTransportAckState(client, 1, 1)
+
+	client.tick()
+	if len(client.actions) != 1 {
+		t.Fatalf("unknown ack removed actions: %+v", client.actions)
+	}
+
+	client.sentActionCounts[2] = 1
+	setClientTransportAckState(client, 2, 1)
+	client.tick()
+	if len(client.actions) != 1 {
+		t.Fatalf("partial ack removed actions: %+v", client.actions)
+	}
+}
+
 // parseMoshConnect extracts port and key from mosh-server output.
 func parseMoshConnect(output string) (int, string) {
 	for _, line := range strings.Split(output, "\n") {
